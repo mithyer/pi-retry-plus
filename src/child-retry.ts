@@ -42,6 +42,8 @@ export interface ChildRetryStatus {
  * `agent_end` event. That keeps AgentSession.prompt() pending; after the
  * hidden follow-up is queued, AgentSession's own post-run loop continues the
  * same transcript and retains completed tool results.
+ *
+ * TEST:__tests__/unit/child-retry.test.ts[ChildRetryController retry lifecycle]
  */
 export class ChildRetryController {
   /** Extension API bound to this exact child session. */
@@ -67,6 +69,10 @@ export class ChildRetryController {
   private retryAttempt = 0;
   /** Prevents duplicate scheduling if an event and manual command race. */
   private driving = false;
+  /** Promise for the schedule currently awaiting its abortable backoff. */
+  private activeSchedule: Promise<void> | undefined;
+  /** Generation that currently owns the driving flag. */
+  private drivingGeneration: number | undefined;
   /** Monotonic cancellation generation for this child prompt. */
   private generation = 0;
   /** Session-wide cancellation source for shutdown and explicit abort. */
@@ -116,6 +122,8 @@ export class ChildRetryController {
     // same-context retry that races the SDK's compaction recovery.
     if (isContextOverflowError(lastAssistant)) {
       this.notify(ctx, "Context overflow - deferring to compaction.", "info");
+      this.resetCounters();
+      this.finishLifecycle(false);
       return;
     }
 
@@ -139,6 +147,7 @@ export class ChildRetryController {
           "Empty response after one continuation - giving up.",
           "warning",
         );
+        this.resetCounters();
         this.finishLifecycle(false);
         return;
       }
@@ -160,6 +169,7 @@ export class ChildRetryController {
           "warning",
         );
       }
+      this.resetCounters();
       this.finishLifecycle(false);
       return;
     }
@@ -183,6 +193,8 @@ export class ChildRetryController {
    *
    * @param event SDK turn event carrying the assistant response.
    * @param ctx SDK context carrying the current abort signal.
+   *
+   * TEST:__tests__/unit/child-retry.test.ts[tool progress keeps retry backoff]
    */
   public handleTurnEnd(
     event: { message: unknown },
@@ -201,8 +213,7 @@ export class ChildRetryController {
     }
     if (
       message.role !== "assistant" ||
-      message.stopReason === "error" ||
-      message.stopReason === "length" ||
+      message.stopReason !== "stop" ||
       hasEmptyStop(event.message as AgentMessage)
     ) {
       return;
@@ -214,12 +225,14 @@ export class ChildRetryController {
 
   /**
    * Cancel an active child backoff when fresh user input arrives.
+   *
+   * TEST:__tests__/unit/child-retry.test.ts[fresh input resets retry backoff]
    */
   public handleInput(): void {
     if (this.closed) return;
     this.generation++;
     this.cancellation.abort("Fresh user input superseded the retry.");
-    this.driving = false;
+    this.resetCounters();
     this.finishLifecycle(false);
     this.cancellation = new AbortController();
   }
@@ -233,7 +246,7 @@ export class ChildRetryController {
     if (this.closed) return;
     this.generation++;
     this.cancellation.abort(reason);
-    this.driving = false;
+    this.resetCounters();
     this.finishLifecycle(false);
   }
 
@@ -245,7 +258,7 @@ export class ChildRetryController {
     this.closed = true;
     this.generation++;
     this.cancellation.abort("Child session shut down.");
-    this.driving = false;
+    this.resetCounters();
     this.finishLifecycle(false);
   }
 
@@ -290,8 +303,28 @@ export class ChildRetryController {
     ctx: ExtensionContext,
   ): Promise<void> {
     if (this.closed || this.driving) return;
+    const scheduled = this.runSchedule(kind, ctx);
+    this.activeSchedule = scheduled;
+    try {
+      await scheduled;
+    } finally {
+      if (this.activeSchedule === scheduled) this.activeSchedule = undefined;
+    }
+  }
+
+  /**
+   * Run one child backoff and queue operation while owning the drive token.
+   *
+   * @param kind Type of hidden turn to queue.
+   * @param ctx SDK context with the active run signal.
+   */
+  private async runSchedule(
+    kind: ChildHiddenTurnKind,
+    ctx: ExtensionContext,
+  ): Promise<void> {
     this.driving = true;
     const generation = this.generation;
+    this.drivingGeneration = generation;
     if (this.lifecycleId === undefined) {
       this.lifecycleId = ++this.nextLifecycleId;
       this.emitLifecycle("pi-retry:started", this.lifecycleId);
@@ -310,6 +343,8 @@ export class ChildRetryController {
           `Retry failed ${this.config.maxRetriesAtMaxDelay} times at the maximum backoff; giving up.`,
           "warning",
         );
+        this.resetCounters();
+        this.finishLifecycle(false);
         return;
       }
       const attempt = kind === "retry" ? this.retryAttempt : this.retryAttempt + 1;
@@ -341,10 +376,31 @@ export class ChildRetryController {
         { triggerTurn: true, deliverAs: kind === "retry" ? "steer" : "followUp" },
       );
     } catch {
+      this.resetCounters();
       this.finishLifecycle(false);
     } finally {
-      this.driving = false;
+      if (this.drivingGeneration === generation) {
+        this.driving = false;
+        this.drivingGeneration = undefined;
+      }
     }
+  }
+
+  /**
+   * Start a manual retry as a new lifecycle, cancelling any automatic backoff first.
+   *
+   * @param ctx SDK context carrying the current error and abort signal.
+   * @returns A promise that settles after the manual schedule has been queued.
+   *
+   * TEST:__tests__/unit/child-retry.test.ts[manual retry after cap, manual retry cancels active backoff]
+   */
+  public async retryManually(ctx: ExtensionContext): Promise<void> {
+    if (this.closed) return;
+    const activeSchedule = this.activeSchedule;
+    this.reset();
+    if (activeSchedule) await activeSchedule;
+    if (this.closed) return;
+    await this.handleAgentEnd(ctx);
   }
 
   /**

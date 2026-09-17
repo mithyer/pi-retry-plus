@@ -116,6 +116,12 @@ async function createChildHarness(
       : [{ pattern: '^<active_agent name="[^"\\r\\n]+"/>$', flags: "m" }]
     : options.matchSystemPromptRegex;
   const subagents = {
+    // Pin child defaults inside the project fixture so a developer's global
+    // piRetry.subagents values cannot stretch these timing-sensitive tests.
+    baseDelayMs,
+    maxDelayMs: baseDelayMs,
+    multiplier: 1,
+    maxRetriesAtMaxDelay: 2,
     ...childRetryConfig,
     ...(configuredMatch === undefined || configuredMatch === null
       ? {}
@@ -692,6 +698,42 @@ describe("native child retry risk coverage", () => {
       expect(harness.faux.state.callCount).toBe(3);
       expect(harness.faux.getPendingResponseCount()).toBe(1);
       expect(harness.session.messages.filter(message => message.role === "custom")).toHaveLength(2);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  // TEST:__tests__/integration/native-child-lifecycle.test.ts[manual retry after cap]
+  it("lets a manual child retry start again after the automatic cap", async () => {
+    const harness = await createChildHarness(
+      [
+        fauxAssistantMessage("initial error", {
+          stopReason: "error",
+          errorMessage: "connection error before manual retry",
+        }),
+        fauxAssistantMessage("automatic retry error", {
+          stopReason: "error",
+          errorMessage: "connection error at manual retry cap",
+        }),
+        fauxAssistantMessage("manual retry recovered"),
+      ],
+      1,
+      { childRetryConfig: { baseDelayMs: 1, maxDelayMs: 1, maxRetriesAtMaxDelay: 1 } },
+    );
+    try {
+      await harness.session.prompt("Reach the child retry cap.");
+      expect(harness.faux.state.callCount).toBe(2);
+
+      // The command must reset the exhausted lifecycle before queueing a new turn.
+      await harness.session.prompt("/retry");
+      await new Promise(resolve => setTimeout(resolve, 20));
+
+      expect(harness.faux.state.callCount).toBe(3);
+      expect(harness.faux.getPendingResponseCount()).toBe(0);
+      expect(harness.session.messages.at(-1)).toMatchObject({
+        role: "assistant",
+        stopReason: "stop",
+      });
     } finally {
       await harness.close();
     }

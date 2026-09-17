@@ -520,7 +520,8 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify("Child retry counters reset", "info");
           return;
         }
-        await controller.handleAgentEnd(ctx);
+        // A manual child command starts a fresh lifecycle, even after automatic cap exhaustion.
+        await controller.retryManually(ctx);
         return;
       }
       const subcommand = args[0]?.toLowerCase();
@@ -776,6 +777,7 @@ export default function (pi: ExtensionAPI) {
   // Before each retry, the error assistant message is removed from
   // agent.state.messages so the LLM receives a clean context (same
   // technique as the built-in retry's _prepareRetry).
+  // TEST:__tests__/unit/user-retry-regression.test.ts[reported retry regressions]
   async function triggerInvisibleContinue(initialKind: HiddenTurnKind, myAgent: Agent) {
     // Keep the Agent that started this loop. Session replacement is handled by
     // the ordinary generation and exact session-manager ownership checks.
@@ -818,7 +820,9 @@ export default function (pi: ExtensionAPI) {
         _inputGeneration !== myInputGeneration
       ) return;
 
-      let attempt = 0;
+      // Count only ordinary retry turns; continuation turns use the next retry slot
+      // without consuming it, so max_tokens/empty responses cannot stretch the error backoff.
+      let retryAttempt = 0;
       let hiddenTurnKind: HiddenTurnKind | null = initialKind;
       // Empty-stop nudges are bounded: a model that produced no usable output
       // and answers the nudge with another empty turn is decided, not stalled.
@@ -859,15 +863,17 @@ export default function (pi: ExtensionAPI) {
           emptyNudges++;
         }
 
-        attempt++;
-        const delay = calculateDelay(attempt, retryConfig);
+        const delayAttempt = hiddenTurnKind === "retry"
+          ? ++retryAttempt
+          : Math.max(1, retryAttempt + 1);
+        const delay = calculateDelay(delayAttempt, retryConfig);
         const isMaxDelay = delay >= retryConfig.maxDelayMs;
         if (hiddenTurnKind === "retry" && isMaxDelay) {
           maxDelayRetries++;
         }
 
         // Notify the user about the upcoming retry attempt.
-        _notifyRetryAttempt(attempt, delay);
+        _notifyRetryAttempt(delayAttempt, delay);
 
         // Interruptible sleep with backoff BEFORE the retry attempt.
         // Polls _userAborted and _sessionGeneration every 100ms so ESC
