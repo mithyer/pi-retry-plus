@@ -14,7 +14,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   recordRetrySessionAgent,
   registerRetrySession,
@@ -70,9 +70,9 @@ function createMockCtx(entries: unknown[] = []) {
     });
   }
   return {
-    ui: { notify: vi.fn() },
+    ui: { notify: vi.fn(), setStatus: vi.fn() },
     sessionManager,
-  } as unknown as ExtensionCommandContext;
+  } as any;
 }
 
 function errorEntry(errorMessage: string, stopReason = "error"): object {
@@ -411,8 +411,8 @@ describe("litmus: bug fix verification", () => {
     }
   });
 
-  // Bug 5: No UI notification → user doesn't know retries are happening
-  it("notifies user about retry attempts via ui.notify", async () => {
+  // Bug 5: A mutable status row keeps the user informed without chat spam.
+  it("shows retry attempts in one mutable status row", async () => {
     const { handlers, restore } = await setup();
     try {
       let attempt = 0;
@@ -443,10 +443,14 @@ describe("litmus: bug fix verification", () => {
 
       await advance(8000);
 
-      expect(ctx.ui.notify).toHaveBeenCalled();
-      const calls = ctx.ui.notify.mock.calls.map((c: any) => c[0]);
-      const retryCalls = calls.filter((c: string) => c.includes("Retry attempt"));
+      expect(ctx.ui.setStatus).toHaveBeenCalled();
+      const calls = ctx.ui.setStatus.mock.calls;
+      const retryCalls = calls.filter((c: any[]) => typeof c[1] === "string" && c[1].includes("Retry attempt"));
       expect(retryCalls.length).toBeGreaterThanOrEqual(1);
+      expect(ctx.ui.notify).not.toHaveBeenCalledWith(
+        expect.stringContaining("Retry attempt"),
+        "info",
+      );
     } finally {
       restore();
     }

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ChildRetryController } from "../../src/child-retry.js";
 
 interface Fixture {
@@ -6,6 +6,8 @@ interface Fixture {
   controller: any;
   delays: number[];
   sends: unknown[];
+  statusUpdates: Array<{ key: string; text: string | undefined }>;
+  notifications: Array<{ message: string; level: string }>;
   ctx: any;
 }
 
@@ -15,14 +17,19 @@ interface Fixture {
  * @param config Retry policy used by the controller.
  * @returns Controller, fake SDK objects, and observed scheduling data.
  */
-function createFixture(config: {
-  baseDelayMs: number;
-  maxDelayMs: number;
-  multiplier: number;
-  maxRetriesAtMaxDelay: number;
-}): Fixture {
+function createFixture(
+  config: {
+    baseDelayMs: number;
+    maxDelayMs: number;
+    multiplier: number;
+    maxRetriesAtMaxDelay: number;
+  },
+  options: { stubBackoff?: boolean } = {},
+): Fixture {
   const delays: number[] = [];
   const sends: unknown[] = [];
+  const statusUpdates: Array<{ key: string; text: string | undefined }> = [];
+  const notifications: Array<{ message: string; level: string }> = [];
   const errorMessage = "connection error";
   const assistantError = {
     role: "assistant",
@@ -38,7 +45,10 @@ function createFixture(config: {
     sessionManager: {
       getEntries: () => [{ type: "message", message: assistantError }],
     },
-    ui: { notify: () => undefined },
+    ui: {
+      notify: (message: string, level: string) => notifications.push({ message, level }),
+      setStatus: (key: string, text: string | undefined) => statusUpdates.push({ key, text }),
+    },
   };
   const pi = {
     events: { emit: () => undefined },
@@ -50,12 +60,14 @@ function createFixture(config: {
     match: { systemPromptRegex: [] },
   }) as any;
 
-  // Keep tests fast while preserving the production delay calculation and send path.
-  controller.waitForBackoff = async (delay: number) => {
-    delays.push(delay);
-    return true;
-  };
-  return { agent, controller, delays, sends, ctx };
+  // Keep most tests fast while preserving the production delay calculation and send path.
+  if (options.stubBackoff !== false) {
+    controller.waitForBackoff = async (delay: number) => {
+      delays.push(delay);
+      return true;
+    };
+  }
+  return { agent, controller, delays, sends, statusUpdates, notifications, ctx };
 }
 
 describe("ChildRetryController retry lifecycle", () => {
@@ -76,6 +88,47 @@ describe("ChildRetryController retry lifecycle", () => {
     await fixture.controller.handleAgentEnd(fixture.ctx);
 
     expect(fixture.delays).toEqual([10, 10]);
+  });
+
+  // TEST:__tests__/unit/child-retry.test.ts[retry countdown updates one status row]
+  it("updates one status row during the backoff countdown", async () => {
+    vi.useFakeTimers();
+    try {
+      const fixture = createFixture(
+        {
+          baseDelayMs: 250,
+          maxDelayMs: 1_000,
+          multiplier: 2,
+          maxRetriesAtMaxDelay: 2,
+        },
+        { stubBackoff: false },
+      );
+      const schedule = fixture.controller.handleAgentEnd(fixture.ctx);
+
+      await vi.advanceTimersByTimeAsync(100);
+      await vi.advanceTimersByTimeAsync(100);
+      await vi.advanceTimersByTimeAsync(50);
+      await schedule;
+
+      const countdownUpdates = fixture.statusUpdates.filter(update => update.text !== undefined);
+      expect(countdownUpdates.map(update => update.key)).toEqual([
+        "pi-retry-backoff",
+        "pi-retry-backoff",
+        "pi-retry-backoff",
+      ]);
+      expect(countdownUpdates.map(update => update.text)).toEqual([
+        "Retry attempt 1 - retrying in 250ms",
+        "Retry attempt 1 - retrying in 150ms",
+        "Retry attempt 1 - retrying in 50ms",
+      ]);
+      expect(fixture.statusUpdates.at(-1)).toEqual({
+        key: "pi-retry-backoff",
+        text: undefined,
+      });
+      expect(fixture.notifications).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   // TEST:__tests__/unit/child-retry.test.ts[fresh input resets retry backoff]

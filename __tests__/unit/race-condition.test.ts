@@ -8,7 +8,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   recordRetrySessionAgent,
   registerRetrySession,
@@ -31,8 +31,8 @@ let activeMockOwner: object | undefined;
 
 interface MockAgentInstance {
   listeners: Set<Function>;
-  waitForIdle: ReturnType<typeof vi.fn>;
-  prompt: ReturnType<typeof vi.fn>;
+  waitForIdle: any;
+  prompt: any;
   state: { isStreaming: boolean; messages: any[] };
   subscribe(listener: Function): () => boolean;
   _setIsStreaming(val: boolean): void;
@@ -99,9 +99,9 @@ function createMockCtx(entries: unknown[] = []) {
     });
   }
   return {
-    ui: { notify: vi.fn() },
+    ui: { notify: vi.fn(), setStatus: vi.fn() },
     sessionManager,
-  } as unknown as ExtensionCommandContext;
+  } as any;
 }
 
 function errorEntry(errorMessage: string, stopReason = "error"): object {
@@ -514,7 +514,7 @@ describe("context overflow defers to compaction", () => {
 
       expect(ctx.ui.notify).toHaveBeenCalled();
       const messages = ctx.ui.notify.mock.calls.map((c: any) => c[0] as string);
-      expect(messages.some((m) => /Context overflow/i.test(m))).toBe(true);
+      expect(messages.some((m: string) => /Context overflow/i.test(m))).toBe(true);
     } finally {
       restore();
     }
@@ -684,10 +684,10 @@ describe("built-in retry coordination", () => {
   });
 });
 
-// ── Bug 5: UI notifications for retries ──
+// ── Bug 5: One mutable status row for retry countdowns ──
 
-describe("retry notifications", () => {
-  it("notifies user about retry attempts", async () => {
+describe("retry countdown status", () => {
+  it("shows retry attempts without adding notification lines", async () => {
     const { handlers, agent, restore } = await setup({
       prompt: vi.fn().mockImplementation(() => {
         const count = agent.prompt.mock.calls.length;
@@ -715,10 +715,14 @@ describe("retry notifications", () => {
       // Advance through multiple backoff sleeps
       await advanceThroughRetry(15000);
 
-      expect(ctx.ui.notify).toHaveBeenCalled();
-      const calls = ctx.ui.notify.mock.calls.map((c: any) => c[0]);
-      const retryCalls = calls.filter((c: string) => c.includes("Retry attempt"));
+      expect(ctx.ui.setStatus).toHaveBeenCalled();
+      const calls = ctx.ui.setStatus.mock.calls;
+      const retryCalls = calls.filter((c: any[]) => typeof c[1] === "string" && c[1].includes("Retry attempt"));
       expect(retryCalls.length).toBeGreaterThanOrEqual(1);
+      expect(ctx.ui.notify).not.toHaveBeenCalledWith(
+        expect.stringContaining("Retry attempt"),
+        "info",
+      );
     } finally {
       restore();
     }

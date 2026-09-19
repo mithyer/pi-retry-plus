@@ -4,6 +4,9 @@
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
+/** Stable status key used to replace the active retry countdown row. */
+export const RETRY_STATUS_KEY = "pi-retry-backoff";
+
 /**
  * Configuration for exponential backoff
  */
@@ -39,6 +42,17 @@ export function formatDuration(ms: number): string {
   const minutes = Math.floor(ms / 60000);
   const seconds = ((ms % 60000) / 1000).toFixed(0);
   return `${minutes}m ${seconds}s`;
+}
+
+/**
+ * Format the single status-bar line used while a retry backoff is active.
+ *
+ * @param attempt Ordinary retry attempt number shown to the user.
+ * @param remainingMs Milliseconds remaining before the hidden retry turn.
+ * @returns Stable status text whose changing duration can replace one UI row.
+ */
+export function formatRetryCountdown(attempt: number, remainingMs: number): string {
+  return `Retry attempt ${attempt} - retrying in ${formatDuration(Math.max(0, remainingMs))}`;
 }
 
 /**

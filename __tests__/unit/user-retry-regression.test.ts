@@ -76,7 +76,7 @@ async function setup() {
   const manager = { getEntries: vi.fn() };
   const owner = api as object;
   activeOwner = owner;
-  const ui = { notify: vi.fn() };
+  const ui = { notify: vi.fn(), setStatus: vi.fn() };
   const ctx: any = { sessionManager: manager, ui };
   const restore = () => {
     unregisterRetrySession(manager, owner);
@@ -156,6 +156,37 @@ describe("reported retry regressions", () => {
       // The two ordinary retries should be separated by 4s, not by an 8s slot consumed by continuation.
       const retryTimes = sent.filter(message => message.kind === "pi-retry:retry").map(message => message.at);
       expect(retryTimes.map(time => time - retryTimes[0]!)).toEqual([0, 8_000]);
+    } finally {
+      restore();
+    }
+  });
+
+  // TEST:__tests__/unit/user-retry-regression.test.ts[ordinary retry countdown status]
+  it("updates and clears one footer status row during ordinary backoff", async () => {
+    const { handlers, manager, ctx, restore, ui } = await setup();
+    try {
+      const agent = attachAgent(manager, currentAgent => {
+        currentAgent.state.messages = [
+          { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] },
+        ];
+      });
+      (ctx.sessionManager.getEntries as any).mockReturnValue([errorEntry()]);
+      for (const handler of handlers["agent_end"] ?? []) {
+        void handler({ messages: [] }, ctx);
+      }
+
+      await advance(100);
+      expect(ui.setStatus).toHaveBeenCalledWith(
+        "pi-retry-backoff",
+        "Retry attempt 1 - retrying in 2.0s",
+      );
+      await advance(1_900);
+      expect(ui.setStatus).toHaveBeenLastCalledWith("pi-retry-backoff", undefined);
+      expect(ui.notify).not.toHaveBeenCalledWith(
+        expect.stringContaining("Retry attempt 1"),
+        "info",
+      );
+      expect(agent.prompt).toHaveBeenCalledTimes(1);
     } finally {
       restore();
     }

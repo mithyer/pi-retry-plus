@@ -18,7 +18,9 @@ import {
   DEFAULT_RETRY_CONFIG,
   loadPiRetrySettings,
   formatDuration,
+  formatRetryCountdown,
   getErrorCategory,
+  RETRY_STATUS_KEY,
   RetryState,
   ContinuationState,
   RETRY_TRIGGER_CUSTOM_TYPE,
@@ -109,19 +111,27 @@ let _sessionGeneration = 0;
 let _terminalInputUnsubscribe: (() => void) | null = null;
 
 // Interruptible sleep: polls _userAborted and _sessionGeneration every
-// 100ms.  Returns true if interrupted (abort or session change), false if
-// the full delay elapsed normally.
+// 100ms. Returns true if interrupted (abort or session change), false if the
+// full delay elapsed normally. The optional callback refreshes one status-bar
+// row instead of emitting a new notification for every countdown tick.
 function interruptibleSleep(
   ms: number,
   generation: number,
   inputGeneration: number,
+  onRemaining?: (remainingMs: number) => void,
 ): Promise<boolean> {
-  if (ms <= 0) return Promise.resolve(false);
+  if (ms <= 0) {
+    onRemaining?.(0);
+    return Promise.resolve(false);
+  }
   return new Promise(resolve => {
     const checkInterval = 100;
     let elapsed = 0;
+    onRemaining?.(ms);
     const timer = setInterval(() => {
       elapsed += checkInterval;
+      const remainingMs = Math.max(0, ms - elapsed);
+      onRemaining?.(remainingMs);
       if (
         _userAborted ||
         _sessionGeneration !== generation ||
@@ -129,7 +139,7 @@ function interruptibleSleep(
       ) {
         clearInterval(timer);
         resolve(true);
-      } else if (elapsed >= ms) {
+      } else if (remainingMs <= 0) {
         clearInterval(timer);
         resolve(false);
       }
@@ -202,6 +212,7 @@ function readEffectiveSystemPrompt(ctx: { getSystemPrompt?: () => string }): str
 
 export default function (pi: ExtensionAPI) {
   let _notifyFn: ((message: string, level: "info" | "warning" | "error") => void) | null = null;
+  let _setStatusFn: ((text: string | undefined) => void) | null = null;
   let retryConfig = { ...DEFAULT_RETRY_CONFIG };
   const owner = pi as unknown as object;
 
@@ -709,7 +720,9 @@ export default function (pi: ExtensionAPI) {
     _continueInProgress = false;
     _continueGeneration = null;
     _continueInputGeneration = null;
+    setRetryStatus(undefined);
     _notifyFn = null;
+    _setStatusFn = null;
     _terminalInputUnsubscribe?.();
     _terminalInputUnsubscribe = null;
   });
@@ -735,7 +748,9 @@ export default function (pi: ExtensionAPI) {
     // finally block releases its owner token. Resetting it here could allow
     // a second loop to start before the old one has settled.
     _userAborted = false;
+    setRetryStatus(undefined);
     _notifyFn = null;
+    _setStatusFn = null;
 
     _terminalInputUnsubscribe?.();
     _terminalInputUnsubscribe = null;
@@ -872,10 +887,9 @@ export default function (pi: ExtensionAPI) {
           maxDelayRetries++;
         }
 
-        // Notify the user about the upcoming retry attempt.
-        _notifyRetryAttempt(delayAttempt, delay);
-
-        // Interruptible sleep with backoff BEFORE the retry attempt.
+        // Interruptible sleep with backoff BEFORE the retry attempt. The
+        // helper emits the initial frame and replaces it every 100ms instead
+        // of adding a chat line.
         // Polls _userAborted and _sessionGeneration every 100ms so ESC
         // and /new take effect within 100ms instead of waiting for the
         // full backoff (up to the configured maximum delay).
@@ -883,7 +897,9 @@ export default function (pi: ExtensionAPI) {
           delay,
           myGeneration,
           myInputGeneration,
+          remainingMs => updateRetryCountdown(delayAttempt, remainingMs),
         );
+        setRetryStatus(undefined);
         if (interrupted || _inputGeneration !== myInputGeneration) return;
 
         try {
@@ -943,6 +959,9 @@ export default function (pi: ExtensionAPI) {
         }
       }
     } finally {
+      // Always remove the mutable countdown row when the loop completes,
+      // aborts, or is invalidated by a session replacement.
+      setRetryStatus(undefined);
       // Release the mutex only if this loop still owns it. If the session was
       // replaced, session_shutdown clears ownership and suppresses the event
       // because the captured pi.events bus is stale by this point.
@@ -961,10 +980,9 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  // Notify the user about a retry attempt via the extension API.
-  // ctx.ui.notify is only available inside event handlers, not inside
-  // triggerInvisibleContinue. We capture a fresh reference from the
-  // most recent handler invocation so it's always current.
+  // UI status methods are only available through an event context, not inside
+  // triggerInvisibleContinue. Capture fresh references so session switches do
+  // not leave the detached retry loop holding an old context.
 
   function isStaleContextError(error: unknown): boolean {
     return error instanceof Error && error.message.includes("This extension ctx is stale");
@@ -994,20 +1012,49 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  /**
+   * Set or clear the one mutable retry countdown status row.
+   *
+   * @param text Status text, or undefined to remove the row.
+   */
+  function setRetryStatus(text: string | undefined): void {
+    if (!_setStatusFn) return;
+    try {
+      _setStatusFn(text);
+    } catch {
+      // Status rendering is advisory. A broken or stale UI must never turn
+      // a retry timer callback into an uncaught exception or stop the retry.
+      _setStatusFn = null;
+    }
+  }
+
+  /**
+   * Refresh the ordinary retry countdown without emitting a chat notification.
+   *
+   * @param attempt Ordinary retry attempt number.
+   * @param remainingMs Milliseconds remaining before the hidden turn.
+   */
+  function updateRetryCountdown(attempt: number, remainingMs: number): void {
+    setRetryStatus(formatRetryCountdown(attempt, remainingMs));
+  }
+
   // Refresh on every handler that carries a ctx — stale references
   // break after session switches (the old ctx becomes invalid).
   pi.on("agent_end", async (_event, ctx) => {
     _notifyFn = (message, level) => ctx.ui.notify(message, level);
+    _setStatusFn = typeof ctx.ui.setStatus === "function"
+      ? text => ctx.ui.setStatus(RETRY_STATUS_KEY, text)
+      : null;
   });
 
   pi.on("turn_end", async (_event, ctx) => {
     if (!_notifyFn) {
       _notifyFn = (message, level) => ctx.ui.notify(message, level);
     }
+    if (!_setStatusFn) {
+      _setStatusFn = typeof ctx.ui.setStatus === "function"
+        ? text => ctx.ui.setStatus(RETRY_STATUS_KEY, text)
+        : null;
+    }
   });
-
-  function _notifyRetryAttempt(attempt: number, delayMs: number) {
-    const duration = formatDuration(delayMs);
-    notifySafely(`Retry attempt ${attempt} (backoff ${duration})...`, "info");
-  }
 }

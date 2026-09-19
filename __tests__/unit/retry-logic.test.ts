@@ -6,6 +6,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import {
   calculateDelay,
   formatDuration,
+  formatRetryCountdown,
   getLastAssistantMessage,
   RetryState,
   ContinuationState,
@@ -70,6 +71,14 @@ describe('formatDuration', () => {
 
   it('handles edge cases', () => {
     expect(formatDuration(0)).toBe('0ms');
+  });
+});
+
+describe('formatRetryCountdown', () => {
+  it('keeps the attempt label stable while replacing the remaining duration', () => {
+    expect(formatRetryCountdown(2, 2500)).toBe('Retry attempt 2 - retrying in 2.5s');
+    expect(formatRetryCountdown(2, 0)).toBe('Retry attempt 2 - retrying in 0ms');
+    expect(formatRetryCountdown(2, -1)).toBe('Retry attempt 2 - retrying in 0ms');
   });
 });
 

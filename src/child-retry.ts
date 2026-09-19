@@ -17,7 +17,8 @@ import {
 import {
   calculateDelay,
   ContinuationState,
-  formatDuration,
+  formatRetryCountdown,
+  RETRY_STATUS_KEY,
   RetryState,
 } from "./retry-logic.js";
 import type { PiRetrySubagentsConfig } from "./config.js";
@@ -194,7 +195,7 @@ export class ChildRetryController {
    * @param event SDK turn event carrying the assistant response.
    * @param ctx SDK context carrying the current abort signal.
    *
-   * TEST:__tests__/unit/child-retry.test.ts[tool progress keeps retry backoff]
+   * TEST:__tests__/unit/child-retry.test.ts[tool success resets retry backoff]
    */
   public handleTurnEnd(
     event: { message: unknown },
@@ -357,8 +358,15 @@ export class ChildRetryController {
       // Removing only a trailing error mirrors SDK native retry and preserves
       // every preceding assistant tool call and tool result in the transcript.
       if (kind === "retry") this.removeErrorFromAgentState();
-      this.notify(ctx, `Retry attempt ${attempt} (backoff ${formatDuration(delay)})...`, "info");
-      const ready = await this.waitForBackoff(delay, ctx.signal, generation);
+      // The wait helper emits the initial frame and replaces it every 100ms
+      // instead of adding a new retry notification line.
+      const ready = await this.waitForBackoff(
+        delay,
+        ctx.signal,
+        generation,
+        remainingMs => this.updateRetryStatus(ctx, attempt, remainingMs),
+      );
+      this.clearRetryStatus(ctx);
       if (!ready || this.closed || generation !== this.generation) return;
 
       this.pi.sendMessage(
@@ -380,6 +388,9 @@ export class ChildRetryController {
       this.resetCounters();
       this.finishLifecycle(false);
     } finally {
+      // Clear the mutable status row on cancellation, failure, and success so
+      // a completed child prompt never leaves an old countdown visible.
+      this.clearRetryStatus(ctx);
       if (this.drivingGeneration === generation) {
         this.driving = false;
         this.drivingGeneration = undefined;
@@ -416,6 +427,7 @@ export class ChildRetryController {
     delayMs: number,
     signal: AbortSignal | undefined,
     generation: number,
+    onRemaining?: (remainingMs: number) => void,
   ): Promise<boolean> {
     if (
       delayMs <= 0 &&
@@ -423,20 +435,29 @@ export class ChildRetryController {
       !this.cancellation.signal.aborted &&
       generation === this.generation
     ) {
+      onRemaining?.(0);
       return Promise.resolve(true);
     }
     return new Promise(resolve => {
       let settled = false;
+      let elapsed = 0;
+      const checkInterval = 100;
       const timer = setTimeout(() => finish(true), Math.max(0, delayMs));
+      const countdownTimer = setInterval(() => {
+        elapsed += checkInterval;
+        onRemaining?.(Math.max(0, delayMs - elapsed));
+      }, checkInterval);
       const finish = (ready: boolean): void => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        clearInterval(countdownTimer);
         signal?.removeEventListener("abort", onAbort);
         this.cancellation.signal.removeEventListener("abort", onAbort);
         resolve(ready && generation === this.generation && !this.closed);
       };
       const onAbort = (): void => finish(false);
+      onRemaining?.(Math.max(0, delayMs));
       signal?.addEventListener("abort", onAbort, { once: true });
       this.cancellation.signal.addEventListener("abort", onAbort, { once: true });
       if (signal?.aborted || this.cancellation.signal.aborted) finish(false);
@@ -492,6 +513,43 @@ export class ChildRetryController {
       completed ? "pi-retry:completed" : "pi-retry:cancelled",
       retryId,
     );
+  }
+
+  /**
+   * Replace the child retry countdown in one footer/status row.
+   *
+   * @param ctx SDK context used for UI output.
+   * @param attempt Ordinary retry attempt number.
+   * @param remainingMs Milliseconds remaining before the hidden turn.
+   */
+  private updateRetryStatus(
+    ctx: ExtensionContext,
+    attempt: number,
+    remainingMs: number,
+  ): void {
+    if (typeof ctx.ui.setStatus !== "function") return;
+    try {
+      ctx.ui.setStatus(
+        RETRY_STATUS_KEY,
+        formatRetryCountdown(attempt, remainingMs),
+      );
+    } catch {
+      // Headless or closing child UIs are advisory and must not break retries.
+    }
+  }
+
+  /**
+   * Remove the child retry countdown from the footer/status row.
+   *
+   * @param ctx SDK context used for UI output.
+   */
+  private clearRetryStatus(ctx: ExtensionContext): void {
+    if (typeof ctx.ui.setStatus !== "function") return;
+    try {
+      ctx.ui.setStatus(RETRY_STATUS_KEY, undefined);
+    } catch {
+      // Headless or closing child UIs are advisory and must not break retries.
+    }
   }
 
   /**
