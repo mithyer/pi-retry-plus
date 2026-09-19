@@ -1,12 +1,352 @@
-# @mithyer/pi-retry-plus
+<div align="center">
 
-A fork of [@monotykamary/pi-retry](https://github.com/monotykamary/pi-retry).
+# 🔄 pi-retry
 
-This fork keeps the original retry behavior and adds special configuration for Pi subagents. It is intended for personal use and will generally stay synchronized with the upstream project, while additional features may be added when needed.
+**Automatic retry for every error in [pi](https://github.com/earendil-works/pi-coding-agent)**
 
-## Subagent configuration
+_400/413, connection errors, credit errors, stream exhaustion — retry them all._
 
-Enable the child-session retry policy in Pi settings:
+[![pi extension](https://img.shields.io/badge/pi-extension-blueviolet)](https://github.com/earendil-works/pi-coding-agent)
+[![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
+
+</div>
+
+---
+
+---
+
+## Overview
+
+This extension automatically detects and retries **all** errors by default, with only a tiny blacklist of known permanent failures (invalid API key, missing model, etc.).
+
+| Error Type | Retry Behavior | Use Case |
+|------------|----------------|----------|
+| **Any retryable error** (catch-all) | **Capped exponential retry** | Everything else — provider hiccups, stream exhaustion, credit issues, unknown errors |
+| HTTP 400/413 | **Capped** with exponential backoff, NO compaction | Transient context overflow that might resolve |
+| Credit / payment errors | **Capped** with exponential backoff | "Not Enough Credits", insufficient balance, 402 — top up and the retry loop auto-resumes |
+| **Quota / session-limit / budget exhaustion** | **Not retried** — notify + stop | "You've hit your limit", `insufficient_quota`, "out of budget", suspended accounts |
+| Connection errors | **Capped** with exponential backoff | Network hiccups, connection drops, socket errors, stream exhaustion |
+| Max tokens (`stopReason: "length"`) | **Auto-continue** indefinitely with hidden continuation turns | Model hits output token limit mid-generation |
+| Empty / think-only stop (`stopReason: "stop"` with no text or tool calls) | **Nudge once** with a hidden continuation, then give up | Model ends its turn with no usable output (Anthropic empty responses with end_turn, thinking-only turns) |
+
+---
+
+## The Problem
+
+By default, pi has built-in retry for some errors (rate limits, 5xx, overloaded), but:
+
+1. **400/413 errors** are treated as context overflow → triggers compaction but NO retry
+2. **Connection errors** sometimes get only limited retries before giving up
+3. **Credit errors** ("Not Enough Credits") are never retried
+4. **Stream exhaustion** ("Max outbound streams") and other provider-specific errors are never retried
+5. **Any unknown error** from a new provider is silently ignored
+
+## The Solution
+
+This extension provides automatic retry for all errors with configurable exponential backoff and a maximum-delay failure limit (2s → 4s → 8s → ... → 60s by default).
+
+**Philosophy: retry EVERYTHING by default.** The only things we skip are a tiny blacklist of known permanent failures (invalid API key, model not found, unsupported model, etc.).
+
+**Features:**
+- **Catch-all retry** — Any `stopReason: "error"` is retried, regardless of error message
+- Automatic detection of 400/413, connection, credit, and stream exhaustion errors
+- **Auto-continuation** when the model hits its max output tokens (`stopReason: "length"`) — indefinite, no cap, hidden from the TUI
+- **Retry cutoff** — Keeps retrying until success, abort, or the configured number of failures at the maximum delay
+- **Auto-stop on quota/budget exhaustion** — Session limits, plan quotas, and budget caps ("You've hit your limit", "out of budget", `insufficient_quota`, suspended accounts) are detected and **not** retried, with a notification explaining why
+- Exponential backoff with configurable base delay, cap, multiplier, and maximum-delay failure count
+- **Hidden triggers** — provider-valid custom messages use `display: false`, so retries do not add TUI clutter
+- Manual controls via unified `/retry` command
+- Non-retryable errors are explicitly logged so you know why we didn't retry
+
+---
+
+## Installation
+
+### Option 1: Install via pi package (Recommended)
+
+Install directly from GitHub as a pi package:
+
+```bash
+pi install https://github.com/monotykamary/pi-retry
+```
+
+Or add to your `settings.json`:
+
+```json
+{
+  "packages": [
+    "https://github.com/monotykamary/pi-retry"
+  ]
+}
+```
+
+### Option 2: Global Installation
+
+Copy the extension to pi's global extensions directory:
+
+```bash
+cp retry.ts ~/.pi/agent/extensions/
+```
+
+### Option 3: Project-Local Installation
+
+Copy to your project's `.pi/extensions/` directory:
+
+```bash
+mkdir -p .pi/extensions
+cp retry.ts .pi/extensions/
+```
+
+### Option 4: Quick Test
+
+```bash
+pi -e ./retry.ts
+```
+
+---
+
+## Usage
+
+Once loaded, the extension **automatically** detects and retries all errors.
+
+### Manual Controls
+
+| Command | Description |
+|---------|-------------|
+| `/retry` | Manually trigger immediate retry (auto-detects: 400/413, credit, connection, max_tokens, or any other error) |
+| `/retry status` | Show current retry diagnostics for all error types + continuation state |
+| `/retry reset` | Reset all retry counters and state |
+
+---
+
+## Configuration
+
+The extension reads a `piRetry` object from Pi's settings files:
+
+- `~/.pi/agent/settings.json` applies globally.
+- `.pi/settings.json` overrides matching global values for the current project.
+
+```json
+{
+  "piRetry": {
+    "baseDelayMs": 10000,
+    "maxDelayMs": 3600000,
+    "multiplier": 2,
+    "maxRetriesAtMaxDelay": 3
+  }
+}
+```
+
+The example above waits 10 seconds before the first retry, doubles each delay, caps the delay at one hour, and stops after three failed retries at that cap. Supported values are:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `baseDelayMs` | `2000` | Delay before the first retry, in milliseconds |
+| `maxDelayMs` | `60000` | Maximum delay between retries, in milliseconds |
+| `multiplier` | `2` | Exponential backoff multiplier; must be at least `1` |
+| `maxRetriesAtMaxDelay` | `3` | Failed ordinary retries allowed after the delay reaches `maxDelayMs` |
+
+`piRetry` is separate from Pi's built-in `retry` object so the two retry policies do not share ambiguous settings. The extension disables Pi's native retry scheduler while it is loaded, while preserving Pi's compaction handling, so only one retry loop owns the backoff schedule.
+
+Settings are read when the extension starts. Restart pi or use `/reload` after editing them.
+
+---
+
+## How It Works
+
+1. **Listen to `agent_end` event** — Fires after each agent turn completes
+2. **Check for any error** — Examine the last assistant message for `stopReason === "error"`
+3. **Blacklist check** — Skip known permanent failures (invalid API key, model not found, quota/session-limit/budget exhaustion, suspended accounts, etc.)
+4. **Categorize for messaging** — Classify into 400/413, credit, connection, or other for nice UI notifications
+5. **Retry or continue with hidden turns** — Wait with exponential backoff, then trigger a provider-valid custom user turn via `pi.sendMessage()` with `display: false` and `triggerTurn: true`
+6. **Valid provider context** — Hidden retry and continuation messages remain in context so providers never receive a trailing assistant message
+7. **Indefinite continuation** — Max_tokens auto-continues are uncapped; repeated `length` stops keep producing continuation turns until the model terminates normally
+8. **Empty-stop recovery** — A `stop` turn with no usable output (only thinking, or nothing at all) gets exactly one hidden "nudge" continuation, then gives up. Matches Anthropic's documented "empty responses with `end_turn`" remedy (continuation prompt in a new user message) — retrying an empty response in place doesn't help because the model has already decided it's done.
+8. **Lifecycle exposure** — Emits `pi-retry:started`, `pi-retry:completed`, and `pi-retry:cancelled` on Pi's shared extension event bus with a matching `retryId`, allowing status integrations to suppress intermediate completion signals
+
+The pi's built-in `transform-messages` already strips aborted/errored assistant messages from the LLM context, so the model never sees the failed attempts.
+
+---
+
+## Detected Error Patterns
+
+### Catch-All (Any Error)
+- **Any** assistant message with `stopReason === "error"` is retried by default
+- Unknown provider errors, stream errors, unexpected failures — all handled automatically
+- Only skipped if it matches a known permanent failure (invalid API key, missing model, etc.)
+
+### Non-Retryable (Permanent Failures)
+These are explicitly **not** retried:
+- Invalid API key / invalid authentication
+- API key not found / missing / revoked
+- Model not found / unknown model / no such model / model does not exist
+- Unsupported model
+
+### Non-Retryable (Quota / Session Limit / Budget)
+Exhausted quotas, session limits, and budgets are auto-detected and stop the retry loop (with an explanatory notification), because retrying is pointless until you act or the reset window passes:
+- **Usage / session limits with reset windows** — "You've hit your limit · resets …" and "5-hour limit reached" (Claude Code), "You've hit your usage limit" / "You've exceeded your usage limit" (Codex), "You have hit your ChatGPT usage limit (plus plan)" (ChatGPT subscription caps via the Codex backend, also `usage_limit_reached`)
+- **Plan / billing quotas** — OpenAI `insufficient_quota`, "You exceeded your current quota, please check your plan and billing details" (OpenAI, Gemini — reached only after pi's built-in 429 retry gives up)
+- **Google subscription caps** — "You have exhausted your capacity on this model. Your quota will reset after …" (Gemini Code Assist), "You have reached the quota limit for …" / "You can resume using this model at …" (Antigravity)
+- **Hard allotments** — OpenRouter `free-models-per-day`, Alibaba Coding Plan window quotas "hour/week/month allocated quota exceeded" and free-quota exhaustion "free allocated quota exceeded" (the bare "Allocated quota exceeded" is TPM rate limiting and stays retryable), GitHub Copilot "premium request allowance", z.ai GLM Coding Plan "Usage limit reached for 5 hour" / "no resource package"
+- **Budget exhaustion** — "out of budget", "Budget has been exceeded" (LiteLLM-style proxies), max/spending/monthly limits
+- **Suspended accounts** — "Your account … is suspended" (Kimi `exceeded_current_quota_error`)
+
+Deliberate distinction: plain pay-as-you-go **balance** errors stay retryable — DeepSeek 402 "Insufficient Balance", OpenRouter 402 "Insufficient credits", Kimi "exceeded your current token quota". A mid-session top-up lets the retry loop auto-resume, whereas session limits and budgets do not self-resolve for hours.
+
+### Max Tokens (stopReason: "length")
+- The model hit its `max_tokens` / output token limit
+- The model's response was truncated mid-generation
+- Auto-continuation sends a provider-valid custom message hidden from the TUI
+
+### 400/413 Errors
+- HTTP 400 Bad Request
+- HTTP 413 Payload Too Large
+- "bad request" messages
+- "payload too large" messages
+
+### Credit / Payment Errors
+- "Not Enough Credits"
+- "insufficient credits"
+- "insufficient balance"
+- "out of credits"
+- "Payment Required"
+- HTTP 402 status code
+
+### Connection Errors
+- Connection / network errors
+- Fetch failures
+- Socket hang up / socket errors
+- `ECONNRESET`, `ECONNREFUSED`, `ETIMEDOUT`, `ENOTFOUND`
+- DNS lookup failures
+- "Request ended without sending any chunks"
+- Upstream connect errors
+- TLS handshake errors
+- Timeouts awaiting response
+- Stream exhaustion ("Max outbound streams is 100, 100 open")
+- Stream limit errors
+
+---
+
+## Development
+
+### Running Tests
+
+```bash
+# Run all tests
+npm test
+
+# Run tests in watch mode
+npm run test:watch
+
+# Run tests with coverage
+npm run test:coverage
+
+# Type check
+npm run typecheck
+
+# Dead code detection
+npm run lint:dead
+```
+
+### Project Structure
+
+```
+.
+├── retry.ts                   # Main unified extension
+├── src/                       # Shared utilities (testable, DRY)
+│   ├── config.ts             # Settings-backed retry configuration
+│   ├── error-patterns.ts      # Error pattern matching, custom types, hasMaxTokensStop
+│   ├── retry-logic.ts         # Retry utilities (calculateDelay, RetryState, ContinuationState, etc.)
+│   └── index.ts               # Barrel exports
+├── __tests__/                 # Unit tests
+│   └── unit/
+│       ├── config.test.ts
+│       ├── error-patterns.test.ts
+│       └── retry-logic.test.ts
+├── vitest.config.ts           # Test configuration
+└── knip.json                  # Dead code detection config
+```
+
+### Code Quality
+
+```bash
+# Run all quality checks
+npm test              # 224 tests
+npm run typecheck     # TypeScript type checking
+npm run lint:dead     # Dead code detection with knip
+```
+
+---
+
+## Troubleshooting
+
+### Extension not working?
+
+Check that it's loaded in the startup header:
+```
+Loaded extensions: retry.ts
+```
+
+### Retry not triggering?
+
+Use the status command to diagnose:
+```
+/retry status
+```
+
+### Want to see what's happening?
+
+The extensions send notifications on retry attempts. Look at the footer status line for retry status updates. Non-retryable errors are logged as errors so you know why we stopped.
+
+### Too many retries?
+
+Use `/retry reset` to clear the counters, or press `Ctrl+C` to abort the session.
+
+---
+
+## Comparison with @georgebashi/pi-retry
+
+The npm package `@georgebashi/pi-retry` handles "aborted" streaming errors but explicitly excludes "connection error" (assuming pi's built-in retry handles it). This extension:
+
+1. **Handles ALL errors** via a catch-all — no more playing whack-a-mole with new error patterns
+2. **Handles connection errors** that pi might not retry sufficiently
+3. **Handles 400/413 errors** without compaction
+4. **Handles credit errors** and stream exhaustion
+
+They can work together for maximum coverage:
+
+```bash
+pi install npm:@georgebashi/pi-retry
+# Plus install this extension
+```
+
+---
+
+## Limitations
+
+- Pi's native retry scheduler is disabled while this extension is loaded so native and extension retries cannot interleave; Pi's compaction check still runs normally
+- Error messages remain in the session history (but are invisible to the LLM)
+- May hit the same error repeatedly if the issue is persistent (use `Ctrl+C` to abort)
+- **Warning**: Retrying 400/413 without reducing context may fail repeatedly if the payload is genuinely too large
+- Non-retryable errors (invalid API key, missing model, quota/session-limit/budget exhaustion) are logged but not retried — you'll need to fix the underlying issue, then use `/retry`
+
+---
+
+## Related
+
+- [Pi Coding Agent Extensions Docs](https://github.com/badlogic/pi/tree/main/packages/coding-agent/docs/extensions.md)
+- [@georgebashi/pi-retry](https://github.com/georgebashi/pi-retry) — Handles "aborted" streaming errors
+- [Issue #252: Connection error with no retry](https://github.com/badlogic/pi-mono/issues/252)
+
+## License
+
+MIT
+
+## Subagent retry policies
+
+Sessions that should retry with a different policy can be selected by matching
+their effective system prompt. This is user configuration: the extension ships
+no built-in marker or identity check for any specific subagent tool.
 
 ```json
 {
@@ -20,23 +360,31 @@ Enable the child-session retry policy in Pi settings:
             "flags": "m"
           }
         ]
-      }
+      },
+      "baseDelayMs": 1000,
+      "maxDelayMs": 10000,
+      "maxRetriesAtMaxDelay": 2
     }
   }
 }
 ```
 
-`pi-subagents` prefixes native child system prompts with an `<active_agent .../>` line. The multiline regular expression above selects those sessions for the child-specific retry policy.
+Semantics:
 
-The extension must also be loaded by the child agent. For an agent definition, add:
+- Sessions whose effective system prompt matches any listed rule use the
+  inline child policy; rules combine with OR.
+- Omitted child fields inherit from the effective top-level policy, field by
+  field. Project matcher lists replace global ones.
+- A matching rule with `enabled: false` leaves pi's native retry scheduler
+  untouched; a missing, empty, malformed, or nonmatching configuration keeps
+  the ordinary `pi-retry` takeover.
+- Patterns are compiled when settings resolve. Invalid syntax, unsupported or
+  duplicate flags, and malformed groups warn and become no-match instead of
+  matching everything.
+- The extension must also be loaded in the target session (for pi-subagents
+  that means listing it in the child's `subagentOnlyExtensions`), not only in
+the parent.
 
-```yaml
-subagentOnlyExtensions:
-  - /absolute/path/to/retry.ts
-```
-
-## Upstream
-
-- Forked from: <https://github.com/monotykamary/pi-retry>
-- Upstream behavior is kept as the compatibility baseline.
-- This fork may contain extra behavior that is not present upstream.
+The example pattern above matches the `<active_agent name="…"/>` line that
+`pi-subagents` prefixes to native child system prompts; substitute your own
+marker if you select child sessions differently.

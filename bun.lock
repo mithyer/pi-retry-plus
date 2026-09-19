@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "@mithyer/pi-retry-plus",
+      "name": "@monotykamary/pi-retry",
       "devDependencies": {
         "@earendil-works/pi-agent-core": "0.85.1",
         "@earendil-works/pi-ai": "0.85.1",
