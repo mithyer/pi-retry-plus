@@ -213,7 +213,8 @@ export class ChildRetryController {
     }
     if (
       message.role !== "assistant" ||
-      message.stopReason !== "stop" ||
+      message.stopReason === "error" ||
+      message.stopReason === "length" ||
       hasEmptyStop(event.message as AgentMessage)
     ) {
       return;

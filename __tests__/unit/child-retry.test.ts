@@ -59,8 +59,8 @@ function createFixture(config: {
 }
 
 describe("ChildRetryController retry lifecycle", () => {
-  // TEST:__tests__/unit/child-retry.test.ts[tool progress keeps retry backoff]
-  it("does not reset the same retry lifecycle after a successful tool turn", async () => {
+  // TEST:__tests__/unit/child-retry.test.ts[tool success resets retry backoff]
+  it("starts at the base delay after a successful tool turn", async () => {
     const fixture = createFixture({
       baseDelayMs: 10,
       maxDelayMs: 1_000,
@@ -75,7 +75,7 @@ describe("ChildRetryController retry lifecycle", () => {
     );
     await fixture.controller.handleAgentEnd(fixture.ctx);
 
-    expect(fixture.delays).toEqual([10, 20]);
+    expect(fixture.delays).toEqual([10, 10]);
   });
 
   // TEST:__tests__/unit/child-retry.test.ts[fresh input resets retry backoff]
