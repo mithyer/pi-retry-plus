@@ -213,6 +213,9 @@ function readEffectiveSystemPrompt(ctx: { getSystemPrompt?: () => string }): str
 export default function (pi: ExtensionAPI) {
   let _notifyFn: ((message: string, level: "info" | "warning" | "error") => void) | null = null;
   let _setStatusFn: ((text: string | undefined) => void) | null = null;
+  // Successful turns can occur inside a run before waitForIdle observes its final error.
+  // TEST:__tests__/unit/user-retry-regression.test.ts[restarts ordinary backoff after tool success inside the same run]
+  let successGeneration = 0;
   let retryConfig = { ...DEFAULT_RETRY_CONFIG };
   const owner = pi as unknown as object;
 
@@ -354,7 +357,9 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     if (msg.role === "assistant" && msg.stopReason !== "error") {
-      if (msg.stopReason !== "length") {
+      if (msg.stopReason !== "length" && !hasEmptyStop(msg)) {
+        // Notify the detached driver as well as resetting diagnostic counters.
+        successGeneration++;
         // Normal completion — reset everything including continuation count
         state400.succeed();
         stateCredit.succeed();
@@ -838,6 +843,8 @@ export default function (pi: ExtensionAPI) {
       // Count only ordinary retry turns; continuation turns use the next retry slot
       // without consuming it, so max_tokens/empty responses cannot stretch the error backoff.
       let retryAttempt = 0;
+      // Track intermediate successful turns, not just the last message at idle.
+      let observedSuccessGeneration = successGeneration;
       let hiddenTurnKind: HiddenTurnKind | null = initialKind;
       // Empty-stop nudges are bounded: a model that produced no usable output
       // and answers the nudge with another empty turn is decided, not stalled.
@@ -878,6 +885,14 @@ export default function (pi: ExtensionAPI) {
           emptyNudges++;
         }
 
+        // A successful tool response ends the previous failure sequence even
+        // when a later request fails before the same Agent run becomes idle.
+        if (observedSuccessGeneration !== successGeneration) {
+          observedSuccessGeneration = successGeneration;
+          retryAttempt = 0;
+          maxDelayRetries = 0;
+          emptyNudges = 0;
+        }
         const delayAttempt = hiddenTurnKind === "retry"
           ? ++retryAttempt
           : Math.max(1, retryAttempt + 1);
@@ -949,6 +964,7 @@ export default function (pi: ExtensionAPI) {
         // check prevents scheduling one more capped request.
         if (
           hiddenTurnKind === "retry" &&
+          observedSuccessGeneration === successGeneration &&
           maxDelayRetries >= retryConfig.maxRetriesAtMaxDelay
         ) {
           notifySafely(

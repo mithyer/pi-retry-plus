@@ -67,7 +67,7 @@ This extension provides automatic retry for all errors with configurable exponen
 Install directly from GitHub as a pi package:
 
 ```bash
-pi install https://github.com/monotykamary/pi-retry
+pi install https://github.com/mithyer/pi-retry
 ```
 
 Or add to your `settings.json`:
@@ -75,7 +75,7 @@ Or add to your `settings.json`:
 ```json
 {
   "packages": [
-    "https://github.com/monotykamary/pi-retry"
+    "https://github.com/mithyer/pi-retry"
   ]
 }
 ```

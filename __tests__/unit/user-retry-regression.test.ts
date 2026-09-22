@@ -127,6 +127,32 @@ async function advance(ms: number) {
 }
 
 describe("reported retry regressions", () => {
+  // Exercise success inside a run: waitForIdle only sees the later request error.
+  it("restarts ordinary backoff after tool success inside the same run", async () => {
+    const { handlers, manager, ctx, restore, ui } = await setup();
+    try {
+      let calls = 0;
+      const agent = attachAgent(manager, currentAgent => {
+        calls++;
+        if (calls === 1) {
+          for (const handler of handlers.turn_end ?? []) {
+            void handler({ message: { role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", id: "t", name: "read", arguments: {} }] } }, ctx);
+          }
+          currentAgent.state.messages = [errorEntry().message];
+        } else {
+          currentAgent.state.messages = [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] }];
+        }
+      });
+      manager.getEntries.mockReturnValue([errorEntry()]);
+      for (const handler of handlers.agent_end ?? []) void handler({ messages: [] }, ctx);
+      await advance(4_100);
+      expect(agent.prompt).toHaveBeenCalledTimes(2);
+      expect(ui.setStatus).not.toHaveBeenCalledWith("pi-retry-backoff", expect.stringContaining("Retry attempt 2"));
+    } finally {
+      restore();
+    }
+  });
+
   // A continuation is not an ordinary retry and must not consume its exponential slot.
   it("keeps ordinary retry backoff independent from a max-token continuation", async () => {
     const { api, handlers, manager, ctx, restore } = await setup();
