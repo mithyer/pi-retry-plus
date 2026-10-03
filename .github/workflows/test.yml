@@ -1,0 +1,74 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  locked:
+    # Verify the declared pi 0.85.1 dependency tree from the committed Bun lockfile.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          # Use a current Bun release so the repository's lockfile format is supported.
+          bun-version: latest
+
+      - name: Install locked dependencies
+        # Keep the baseline job reproducible; the compatibility matrix below is intentionally different.
+        run: bun install --frozen-lockfile
+
+      - name: Run tests
+        run: bun run test -- --reporter=dot
+
+      - name: Run type check
+        run: bun run typecheck
+
+      - name: Run dead-code check
+        run: bun run lint:dead
+
+  test:
+    # Exercise both the legacy live-state fallback and pi's canonical context projection.
+    # This compatibility matrix intentionally bypasses bun.lock to install each exact SDK version.
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk-version: ["0.85.1", "1.0.1"]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+
+      - name: Install dependencies for the SDK matrix entry
+        run: >-
+          npm install --no-package-lock --ignore-scripts --no-save
+          @earendil-works/pi-ai@${{ matrix.sdk-version }}
+          @earendil-works/pi-agent-core@${{ matrix.sdk-version }}
+          @earendil-works/pi-coding-agent@${{ matrix.sdk-version }}
+          @earendil-works/pi-tui@${{ matrix.sdk-version }}
+          @types/node@25.9.1
+          @vitest/coverage-v8@4.1.7
+          knip@6.14.1
+          typescript@6.0.3
+          vitest@4.1.7
+
+      - name: Run tests
+        run: npm test -- --reporter=dot
+
+      - name: Run type check
+        run: npm run typecheck
+
+      - name: Run dead-code check
+        run: npm run lint:dead

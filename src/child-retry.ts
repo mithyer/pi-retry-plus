@@ -22,6 +22,7 @@ import {
   RetryState,
 } from "./retry-logic.js";
 import type { PiRetrySubagentsConfig } from "./config.js";
+import { removeErrorFromRetryContext } from "./session-registry.js";
 
 /** The hidden turn kinds that can continue an owned child prompt. */
 export type ChildHiddenTurnKind = "retry" | "continue" | "empty";
@@ -355,9 +356,12 @@ export class ChildRetryController {
         this.maxDelayRetries++;
       }
 
-      // Removing only a trailing error mirrors SDK native retry and preserves
-      // every preceding assistant tool call and tool result in the transcript.
-      if (kind === "retry") this.removeErrorFromAgentState();
+      // Remove the failed response from Pi's canonical projection before retrying.
+      // The helper keeps raw history intact on newer SDKs and falls back to the
+      // live Agent state on older versions.
+      if (kind === "retry") {
+        removeErrorFromRetryContext(ctx.sessionManager, this.agent);
+      }
       // The wait helper emits the initial frame and replaces it every 100ms
       // instead of adding a new retry notification line.
       const ready = await this.waitForBackoff(
@@ -462,17 +466,6 @@ export class ChildRetryController {
       this.cancellation.signal.addEventListener("abort", onAbort, { once: true });
       if (signal?.aborted || this.cancellation.signal.aborted) finish(false);
     });
-  }
-
-  /**
-   * Remove only an error assistant response from this child's live state.
-   */
-  private removeErrorFromAgentState(): void {
-    const messages = this.agent.state.messages;
-    const last = messages[messages.length - 1];
-    if (last?.role === "assistant" && last.stopReason === "error") {
-      this.agent.state.messages = messages.slice(0, -1);
-    }
   }
 
   /**
