@@ -398,7 +398,6 @@ describe("native child retry lifecycle", () => {
       }
     }
   });
-
   // User-configured OR rules, arbitrary markers, and flags select inline recovery.
   it("selects inline recovery from an arbitrary configured system prompt rule", async () => {
     const harness = await createChildHarness(
@@ -572,6 +571,74 @@ describe("native child retry lifecycle", () => {
       expect(harness.faux.state.callCount).toBe(2);
       expect(harness.session.messages.filter(message => message.role === "custom")).toHaveLength(0);
     } finally {
+      await harness.close();
+    }
+  });
+
+  // TEST:__tests__/integration/native-child-lifecycle.test.ts[omits the failed assistant from the next request context]
+  it("omits the failed assistant from the next request context", async () => {
+    const contexts: Context[] = [];
+    let resolveSecondContext: (() => void) | undefined;
+    const secondContext = new Promise<void>(resolve => {
+      resolveSecondContext = resolve;
+    });
+    let secondRequestStarted = false;
+    let resolveRecoverySettled: (() => void) | undefined;
+    const recoverySettled = new Promise<void>(resolve => {
+      resolveRecoverySettled = resolve;
+    });
+    const harness = await createChildHarness(
+      [
+        context => {
+          contexts.push({ ...context, messages: [...context.messages] });
+          return fauxAssistantMessage("first request failed", {
+            stopReason: "error",
+            errorMessage: "deterministic transient connection error",
+          });
+        },
+        context => {
+          contexts.push({ ...context, messages: [...context.messages] });
+          secondRequestStarted = true;
+          resolveSecondContext?.();
+          const hasFailedAssistant = context.messages.some(
+            message => message.role === "assistant" && message.stopReason === "error",
+          );
+          return hasFailedAssistant
+            ? fauxAssistantMessage("stale failed assistant remained", {
+                stopReason: "error",
+                errorMessage: "canonical retry context still contains failed assistant",
+              })
+            : fauxAssistantMessage("canonical context recovered");
+        },
+      ],
+      0,
+      { nativeRetryEnabled: true, childMarker: false },
+    );
+    const unsubscribe = harness.session.subscribe((event: any) => {
+      // The first agent_settled event belongs to the failed original prompt;
+      // only settle the test after the hidden retry has actually started.
+      if (secondRequestStarted && event.type === "agent_settled") {
+        resolveRecoverySettled?.();
+        resolveRecoverySettled = undefined;
+      }
+    });
+    try {
+      // Ordinary sessions detach the retry driver; wait for both the provider
+      // callback and the final AgentSession settlement.
+      await harness.session.prompt("Check canonical retry context.");
+      await secondContext;
+      await recoverySettled;
+      expect(contexts).toHaveLength(2);
+      expect(contexts[1]?.messages.some(
+        message => message.role === "assistant" && message.stopReason === "error",
+      )).toBe(false);
+      expect(harness.faux.state.callCount).toBe(2);
+      expect(harness.session.messages.at(-1)).toMatchObject({
+        role: "assistant",
+        stopReason: "stop",
+      });
+    } finally {
+      unsubscribe();
       await harness.close();
     }
   });

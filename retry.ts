@@ -31,6 +31,7 @@ import {
   getRetrySession,
   getSessionAgent,
   installRetrySdkHooks,
+  removeErrorFromRetryContext,
   registerRetrySession,
   unregisterRetrySession,
 } from "./src/session-registry.js";
@@ -73,8 +74,8 @@ const sdkHooksSupported = installRetrySdkHooks();
  *     It fires triggerInvisibleContinue() immediately, keeping processEvents
  *     unblocked so the agent can finish its run and become idle.
  *   - triggerInvisibleContinue() owns the retry loop: it waits for idle,
- *     removes error assistant messages from live state, queues a hidden
- *     AgentSession turn, and checks the result. On error it sleeps outside
+ *     omits failed responses from Pi's canonical retry projection, queues a
+ *     hidden AgentSession turn, and checks the result. On error it sleeps outside
  *     processEvents and retries. On success or user abort the loop exits.
  */
 
@@ -147,17 +148,6 @@ function interruptibleSleep(
   });
 }
 
-// Remove the error assistant message at the end of agent state, if present.
-// Same technique used by the built-in retry in _prepareRetry — the error
-// message stays in the session journal for history but is removed from the
-// agent's live transcript so the LLM receives a clean context on retry.
-function removeErrorFromAgentState(agent: Agent): void {
-  const messages = agent.state.messages;
-  const lastMsg = messages[messages.length - 1];
-  if (lastMsg?.role === 'assistant' && lastMsg.stopReason === 'error') {
-    agent.state.messages = messages.slice(0, -1);
-  }
-}
 
 type HiddenTurnKind = "retry" | "continue" | "empty";
 
@@ -213,6 +203,9 @@ function readEffectiveSystemPrompt(ctx: { getSystemPrompt?: () => string }): str
 export default function (pi: ExtensionAPI) {
   let _notifyFn: ((message: string, level: "info" | "warning" | "error") => void) | null = null;
   let _setStatusFn: ((text: string | undefined) => void) | null = null;
+  // Successful turns can occur inside a run before waitForIdle observes its final error.
+  // TEST:__tests__/unit/user-retry-regression.test.ts[restarts ordinary backoff after tool success inside the same run]
+  let successGeneration = 0;
   let retryConfig = { ...DEFAULT_RETRY_CONFIG };
   const owner = pi as unknown as object;
 
@@ -303,9 +296,10 @@ export default function (pi: ExtensionAPI) {
     kind: HiddenTurnKind,
     ctx: { sessionManager?: unknown },
   ): void {
-    const agent = getSessionAgent(ctx.sessionManager);
+    const sessionManager = ctx.sessionManager;
+    const agent = getSessionAgent(sessionManager);
     if (!agent) return;
-    void triggerInvisibleContinue(kind, agent);
+    void triggerInvisibleContinue(kind, agent, sessionManager);
   }
 
   pi.on("before_agent_start", (event, ctx) => {
@@ -354,7 +348,9 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     if (msg.role === "assistant" && msg.stopReason !== "error") {
-      if (msg.stopReason !== "length") {
+      if (msg.stopReason !== "length" && !hasEmptyStop(msg)) {
+        // Notify the detached driver as well as resetting diagnostic counters.
+        successGeneration++;
         // Normal completion — reset everything including continuation count
         state400.succeed();
         stateCredit.succeed();
@@ -789,11 +785,21 @@ export default function (pi: ExtensionAPI) {
   // has settled, so it does NOT block the agent. The agent is idle during
   // the sleep and can respond to user input (e.g. Escape to abort).
   //
-  // Before each retry, the error assistant message is removed from
-  // agent.state.messages so the LLM receives a clean context (same
-  // technique as the built-in retry's _prepareRetry).
+  // Before each retry, omit the failed response from Pi's canonical
+  // SessionManager projection; older SDKs use the live Agent-state fallback.
   // TEST:__tests__/unit/user-retry-regression.test.ts[reported retry regressions]
-  async function triggerInvisibleContinue(initialKind: HiddenTurnKind, myAgent: Agent) {
+  /**
+   * Drive hidden retry and continuation turns for one session.
+   *
+   * @param initialKind Hidden turn kind selected by the event or command.
+   * @param myAgent Agent bound to the triggering session.
+   * @param sessionManager Stable session-manager identity used by the registry.
+   */
+  async function triggerInvisibleContinue(
+    initialKind: HiddenTurnKind,
+    myAgent: Agent,
+    sessionManager: unknown,
+  ) {
     // Keep the Agent that started this loop. Session replacement is handled by
     // the ordinary generation and exact session-manager ownership checks.
     if (!myAgent) return;
@@ -838,6 +844,8 @@ export default function (pi: ExtensionAPI) {
       // Count only ordinary retry turns; continuation turns use the next retry slot
       // without consuming it, so max_tokens/empty responses cannot stretch the error backoff.
       let retryAttempt = 0;
+      // Track intermediate successful turns, not just the last message at idle.
+      let observedSuccessGeneration = successGeneration;
       let hiddenTurnKind: HiddenTurnKind | null = initialKind;
       // Empty-stop nudges are bounded: a model that produced no usable output
       // and answers the nudge with another empty turn is decided, not stalled.
@@ -862,7 +870,7 @@ export default function (pi: ExtensionAPI) {
           didRetryComplete = true;
           return;
         }
-        removeErrorFromAgentState(myAgent);
+        removeErrorFromRetryContext(sessionManager, myAgent);
 
         // Empty-stop cap: a model that produced no usable output and answers
         // the nudge with another empty turn is decided, not stalled. Stop
@@ -878,6 +886,14 @@ export default function (pi: ExtensionAPI) {
           emptyNudges++;
         }
 
+        // A successful tool response ends the previous failure sequence even
+        // when a later request fails before the same Agent run becomes idle.
+        if (observedSuccessGeneration !== successGeneration) {
+          observedSuccessGeneration = successGeneration;
+          retryAttempt = 0;
+          maxDelayRetries = 0;
+          emptyNudges = 0;
+        }
         const delayAttempt = hiddenTurnKind === "retry"
           ? ++retryAttempt
           : Math.max(1, retryAttempt + 1);
@@ -949,6 +965,7 @@ export default function (pi: ExtensionAPI) {
         // check prevents scheduling one more capped request.
         if (
           hiddenTurnKind === "retry" &&
+          observedSuccessGeneration === successGeneration &&
           maxDelayRetries >= retryConfig.maxRetriesAtMaxDelay
         ) {
           notifySafely(

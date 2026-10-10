@@ -1,9 +1,10 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   getRetrySession,
   getSessionAgent,
   recordRetrySessionAgent,
   registerRetrySession,
+  removeErrorFromRetryContext,
   unregisterRetrySession,
 } from "../../src/session-registry.js";
 
@@ -61,6 +62,30 @@ describe("session registry ownership", () => {
     expect(getSessionAgent(manager)).toBeUndefined();
   });
 
+  // Pi 0.87+ exposes canonical context omission through the session object.
+  // TEST:__tests__/unit/session-registry.test.ts[uses canonical retry omission]
+  it("uses the canonical omission hook when the SDK provides one", () => {
+    const manager = {};
+    const failedMessage = {
+      role: "assistant",
+      stopReason: "error",
+      errorMessage: "transient connection error",
+    };
+    const agent = { state: { messages: [failedMessage] } } as any;
+    const owner = {};
+    const omitRecoveryAttempt = vi.fn();
+    recordRetrySessionAgent(manager, agent, {
+      sessionManager: manager,
+      agent,
+      _omitRecoveryAttempt: omitRecoveryAttempt,
+    });
+    registrations.push({ manager, owner });
+
+    removeErrorFromRetryContext(manager, agent);
+
+    expect(omitRecoveryAttempt).toHaveBeenCalledWith(failedMessage);
+    expect(agent.state.messages).toEqual([failedMessage]);
+  });
   // Session-manager WeakMap keys keep sibling main/child sessions isolated.
   it("isolates ownership and Agent identity between sibling sessions", () => {
     const first = createRegistration();
