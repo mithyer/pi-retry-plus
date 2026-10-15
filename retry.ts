@@ -148,6 +148,54 @@ function interruptibleSleep(
   });
 }
 
+// Upper bound for waiting until a hidden retry turn actually starts running.
+// Pi >= 1.2 prepares a run asynchronously (auto-compaction check plus every
+// before_agent_start handler) and compaction may call a model, so allow a long
+// window. User actions still interrupt the wait within one poll tick.
+const HIDDEN_RUN_START_TIMEOUT_MS = 10 * 60 * 1000;
+const HIDDEN_RUN_START_POLL_MS = 10;
+
+/**
+ * Wait until a hidden turn queued with pi.sendMessage() has really started.
+ *
+ * Pi >= 1.2 builds the run asynchronously, so right after sendMessage() the
+ * low-level Agent has no active run yet and Agent.waitForIdle() resolves at once.
+ * Treating that as "the retry turn finished" ends the loop early and discards the
+ * backoff counter, so every failure restarts at the base delay.
+ *
+ * @param hasStarted Returns true once the hidden turn emitted agent_start.
+ * @param generation Session generation captured by the waiting loop.
+ * @param inputGeneration Input generation captured by the waiting loop.
+ * @returns true when the run started; false when interrupted (abort, new input,
+ *   session change) or when the safety timeout elapsed.
+ */
+// TEST:__tests__/integration/main-backoff.test.ts[grows the delay between consecutive failures instead of repeating the base delay]
+function waitForHiddenRunStart(
+  hasStarted: () => boolean,
+  generation: number,
+  inputGeneration: number,
+): Promise<boolean> {
+  if (hasStarted()) return Promise.resolve(true);
+  return new Promise(resolve => {
+    let elapsed = 0;
+    const timer = setInterval(() => {
+      elapsed += HIDDEN_RUN_START_POLL_MS;
+      if (hasStarted()) {
+        clearInterval(timer);
+        resolve(true);
+      } else if (
+        _userAborted ||
+        _sessionGeneration !== generation ||
+        _inputGeneration !== inputGeneration ||
+        elapsed >= HIDDEN_RUN_START_TIMEOUT_MS
+      ) {
+        // The caller re-checks the same guards right after this returns.
+        clearInterval(timer);
+        resolve(false);
+      }
+    }, HIDDEN_RUN_START_POLL_MS);
+  });
+}
 
 type HiddenTurnKind = "retry" | "continue" | "empty";
 
@@ -206,6 +254,11 @@ export default function (pi: ExtensionAPI) {
   // Successful turns can occur inside a run before waitForIdle observes its final error.
   // TEST:__tests__/unit/user-retry-regression.test.ts[restarts ordinary backoff after tool success inside the same run]
   let successGeneration = 0;
+  // Number of agent runs this session has started. The detached retry loop uses
+  // it to tell that a hidden turn queued with sendMessage() is really running.
+  // Kept per extension instance so a concurrent subagent session cannot fake it.
+  // TEST:__tests__/integration/main-backoff.test.ts[grows the delay between consecutive failures instead of repeating the base delay]
+  let agentStartCount = 0;
   let retryConfig = { ...DEFAULT_RETRY_CONFIG };
   const owner = pi as unknown as object;
 
@@ -304,6 +357,11 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("before_agent_start", (event, ctx) => {
     configureSession(ctx, event.systemPrompt);
+  });
+
+  // Count started runs; see waitForHiddenRunStart().
+  pi.on("agent_start", () => {
+    agentStartCount++;
   });
 
   pi.on("input", (_event, ctx) => {
@@ -919,6 +977,8 @@ export default function (pi: ExtensionAPI) {
         if (interrupted || _inputGeneration !== myInputGeneration) return;
 
         try {
+          // Snapshot before sending: agent_start may fire before sendMessage returns.
+          const startsBeforeSend = agentStartCount;
           pi.sendMessage(
             {
               customType: hiddenTurnKind === "retry"
@@ -935,10 +995,18 @@ export default function (pi: ExtensionAPI) {
             { triggerTurn: true, deliverAs: "followUp" },
           );
 
-          // sendMessage is fire-and-forget, but AgentSession publishes the
-          // low-level run synchronously before returning. Waiting on Agent
-          // keeps this retry loop intact without bypassing session state.
+          // sendMessage is fire-and-forget. Pi 1.1 published the low-level run
+          // synchronously, but Pi >= 1.2 awaits run preparation (compaction check
+          // and every before_agent_start handler) first, so Agent.waitForIdle()
+          // alone would return before the hidden turn exists. That ended this loop
+          // after one retry and the agent_end handler restarted it with
+          // retryAttempt = 0, i.e. a flat base delay. Wait for agent_start first.
           await Promise.resolve();
+          await waitForHiddenRunStart(
+            () => agentStartCount > startsBeforeSend,
+            myGeneration,
+            myInputGeneration,
+          );
           await myAgent.waitForIdle();
         } catch {
           return;

@@ -39,6 +39,18 @@ function errorEntry(stopReason = "error") {
 }
 
 /**
+ * Deliver agent_start to the extension like AgentSession does when a run begins.
+ * The retry loop waits for it before it waits for the hidden turn to finish.
+ *
+ * @param handlers Event handlers registered by the extension under test.
+ */
+function emitAgentStart(handlers: Record<string, Function[]>): void {
+  for (const handler of handlers["agent_start"] ?? []) {
+    void handler({ type: "agent_start" }, {});
+  }
+}
+
+/**
  * Create the smallest ExtensionAPI surface used by the ordinary retry driver.
  *
  * @returns Fake API, event handlers, and registered commands.
@@ -55,6 +67,7 @@ function createApi() {
       commands[name] = options;
     },
     sendMessage: vi.fn((message: unknown) => {
+      emitAgentStart(handlers);
       void activeAgent?.prompt([message]).catch(() => undefined);
     }),
   } as any;
@@ -170,6 +183,7 @@ describe("reported retry regressions", () => {
       });
       api.sendMessage.mockImplementation((message: any) => {
         sent.push({ kind: message.customType, at: Date.now() });
+        emitAgentStart(handlers);
         void agent.prompt();
       });
       (ctx.sessionManager.getEntries as any).mockReturnValue([errorEntry()]);
