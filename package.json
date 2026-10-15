@@ -1,6 +1,6 @@
 {
   "name": "@mithyer/pi-retry-plus",
-  "version": "0.10.5-1",
+  "version": "0.10.5-2",
   "description": "Extension suite for pi coding agent that handles 400/413 errors and connection errors with automatic retry",
   "type": "module",
   "author": "mithyer",
