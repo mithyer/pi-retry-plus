@@ -79,11 +79,19 @@ interface ChildHarnessOptions {
     maxDelayMs?: number;
     multiplier?: number;
     maxRetriesAtMaxDelay?: number;
+    messageFreeRetries?: boolean;
   };
   /** Public custom tool definitions enabled for the session. */
   customTools?: ToolDefinition[];
   /** Restrict active tools when a custom-tool case needs one deterministic tool. */
   tools?: string[];
+  /** Run mode reported to extensions; SDK hosts without a mode report "print". */
+  mode?: "print" | "json" | "rpc";
+  /** Top-level policy fields that override the harness defaults. */
+  mainRetryConfig?: {
+    maxRetriesAtMaxDelay?: number;
+    messageFreeRetries?: boolean;
+  };
 }
 
 /**
@@ -132,6 +140,7 @@ async function createChildHarness(
     maxDelayMs: baseDelayMs,
     multiplier: 1,
     maxRetriesAtMaxDelay: 2,
+    ...(options.mainRetryConfig ?? {}),
     ...(Object.keys(subagents).length > 0 ? { subagents } : {}),
   };
   writeFileSync(
@@ -235,7 +244,7 @@ async function createChildHarness(
     customTools: options.customTools,
     tools: options.tools,
   });
-  await session.bindExtensions({ mode: "print" });
+  await session.bindExtensions({ mode: options.mode ?? "print" });
 
   let resolveFirstError: (() => void) | undefined;
   let resolveFirstErrorBackoff: (() => void) | undefined;
@@ -448,7 +457,9 @@ describe("native child retry lifecycle", () => {
         fauxAssistantMessage("ordinary route recovered"),
       ],
       0,
-      { nativeRetryEnabled: true, matchSystemPromptRegex: null },
+      // RPC hosts stay attached after a prompt settles, so they keep the
+      // detached ordinary route; print hosts are covered separately below.
+      { nativeRetryEnabled: true, matchSystemPromptRegex: null, mode: "rpc" },
     );
     try {
       // The ordinary route intentionally detaches its hidden retry, so the
@@ -479,6 +490,7 @@ describe("native child retry lifecycle", () => {
       {
         nativeRetryEnabled: true,
         matchSystemPromptRegex: [{ pattern: "[" }],
+        mode: "rpc",
       },
     );
     try {
@@ -536,6 +548,7 @@ describe("native child retry lifecycle", () => {
         nativeRetryEnabled: true,
         systemPrompt: '<active_agent name="worker"/>',
         matchSystemPromptRegex,
+        mode: "rpc",
       },
     );
     try {
@@ -639,6 +652,374 @@ describe("native child retry lifecycle", () => {
       });
     } finally {
       unsubscribe();
+      await harness.close();
+    }
+  });
+});
+
+/**
+ * Unmatched sessions in print/JSON mode: hosts such as `pi -p`, `--mode json`,
+ * and SDK child launchers (pi-subagents binds without a mode, which Pi reports
+ * as "print") consume the result as soon as prompt() settles.
+ */
+describe("prompt-scoped ordinary sessions", () => {
+  // TEST:__tests__/integration/native-child-lifecycle.test.ts[prompt-scoped ordinary sessions]
+  it("recovers an unconfigured child whose host disposes it when prompt settles", async () => {
+    const harness = await createChildHarness(
+      [
+        fauxAssistantMessage("child request failed", {
+          stopReason: "error",
+          errorMessage: "fetch failed",
+        }),
+        fauxAssistantMessage("unconfigured child recovered"),
+      ],
+      30,
+      // The pi-subagents marker is present, but no piRetry.subagents rule is
+      // configured: this is the default setup from issue #13.
+      { nativeRetryEnabled: true, matchSystemPromptRegex: null },
+    );
+    let closed = false;
+    try {
+      let promptSettled = false;
+      const promptPromise = harness.session.prompt("Task: recover without child configuration").then(() => {
+        promptSettled = true;
+      });
+
+      await harness.waitForFirstErrorBackoff();
+      expect(promptSettled).toBe(false);
+
+      // Mirror a child host: read the result and dispose as soon as prompt() settles.
+      await promptPromise;
+      const result = harness.session.getLastAssistantText();
+      await harness.close();
+      closed = true;
+
+      expect(result).toBe("unconfigured child recovered");
+      expect(harness.faux.state.callCount).toBe(2);
+      expect(harness.faux.getPendingResponseCount()).toBe(0);
+    } finally {
+      if (!closed) await harness.close();
+    }
+  });
+
+  it("keeps JSON-mode prompts pending through retry recovery", async () => {
+    const harness = await createChildHarness(
+      [
+        fauxAssistantMessage("json request failed", {
+          stopReason: "error",
+          errorMessage: "WebSocket closed 1000",
+        }),
+        fauxAssistantMessage("json mode recovered"),
+      ],
+      30,
+      { nativeRetryEnabled: true, childMarker: false, mode: "json" },
+    );
+    try {
+      await harness.session.prompt("Task: recover in JSON mode");
+      expect(harness.faux.state.callCount).toBe(2);
+      expect(harness.session.getLastAssistantText()).toBe("json mode recovered");
+    } finally {
+      await harness.close();
+    }
+  });
+
+  // Unmatched sessions keep the top-level policy; child overrides apply only to matches.
+  it("applies the top-level policy, not child overrides, to unmatched sessions", async () => {
+    const harness = await createChildHarness(
+      [
+        fauxAssistantMessage("error one", { stopReason: "error", errorMessage: "connection error one" }),
+        fauxAssistantMessage("error two", { stopReason: "error", errorMessage: "connection error two" }),
+        fauxAssistantMessage("unexpected third request"),
+      ],
+      1,
+      {
+        childMarker: false,
+        mainRetryConfig: { maxRetriesAtMaxDelay: 1 },
+        childRetryConfig: { maxRetriesAtMaxDelay: 5 },
+      },
+    );
+    try {
+      await harness.session.prompt("Stop after the top-level retry cap.");
+
+      // The initial request plus exactly one capped retry are delivered.
+      expect(harness.faux.state.callCount).toBe(2);
+      expect(harness.faux.getPendingResponseCount()).toBe(1);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("does not retry an unmatched print-mode prompt after abort", async () => {
+    const harness = await createChildHarness(
+      [
+        fauxAssistantMessage("backoff error", {
+          stopReason: "error",
+          errorMessage: "connection error during backoff",
+        }),
+        fauxAssistantMessage("must not arrive after abort"),
+      ],
+      250,
+      { childMarker: false },
+    );
+    try {
+      const promptPromise = harness.session.prompt("Abort during ordinary print-mode backoff.");
+      await harness.waitForFirstError();
+      const settled = await Promise.race([
+        harness.session.abort().then(() => true),
+        new Promise<boolean>(resolve => setTimeout(() => resolve(false), 1_000)),
+      ]);
+
+      expect(settled).toBe(true);
+      await promptPromise;
+      await new Promise(resolve => setTimeout(resolve, 300));
+      expect(harness.faux.state.callCount).toBe(1);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  // A matching enabled:false rule still hands the session to native retry.
+  it("keeps native retry for a matched child with enabled false", async () => {
+    const harness = await createChildHarness(
+      [
+        fauxAssistantMessage("first request failed", {
+          stopReason: "error",
+          errorMessage: "deterministic transient connection error",
+        }),
+        fauxAssistantMessage("native retry recovered"),
+      ],
+      0,
+      { nativeRetryEnabled: true, childRetryEnabled: false, mode: "json" },
+    );
+    try {
+      await harness.session.prompt("Task: use native retry in JSON mode");
+      expect(harness.faux.state.callCount).toBe(2);
+      expect(harness.session.messages.filter(message => message.role === "custom")).toHaveLength(0);
+    } finally {
+      await harness.close();
+    }
+  });
+});
+
+/**
+ * Opt-in message-free error retries (issue #11): the failed response is
+ * omitted with a durable context_edit at the settle boundary and the same
+ * context is continued, with no hidden retry message.
+ */
+describe("message-free retries", () => {
+  /** Roles of one provider request, for comparing retried contexts. */
+  const roles = (context: Context | undefined) => context?.messages.map(message => message.role);
+
+  // TEST:__tests__/integration/native-child-lifecycle.test.ts[message-free retries]
+  it("retries a child error with the identical context and no injected message", async () => {
+    const contexts: Context[] = [];
+    const harness = await createChildHarness(
+      [
+        context => {
+          contexts.push({ ...context, messages: [...context.messages] });
+          return fauxAssistantMessage("failed attempt", {
+            stopReason: "error",
+            errorMessage: "fetch failed",
+          });
+        },
+        context => {
+          contexts.push({ ...context, messages: [...context.messages] });
+          return fauxAssistantMessage("message-free recovery");
+        },
+      ],
+      30,
+      { nativeRetryEnabled: true, childRetryConfig: { messageFreeRetries: true } },
+    );
+    try {
+      let promptSettled = false;
+      const promptPromise = harness.session.prompt("Task: recover without a retry message").then(() => {
+        promptSettled = true;
+      });
+      await harness.waitForFirstErrorBackoff();
+      expect(promptSettled).toBe(false);
+      await promptPromise;
+
+      expect(harness.faux.state.callCount).toBe(2);
+      expect(harness.session.getLastAssistantText()).toBe("message-free recovery");
+      expect(roles(contexts[1])).toEqual(roles(contexts[0]));
+      expect(contexts[1]?.messages.at(-1)).toMatchObject({ role: "user" });
+      expect(harness.session.messages.filter(message => message.role === "custom")).toHaveLength(0);
+
+      // The failed attempt stays in raw history and is omitted durably, so a
+      // resumed session projects the same clean context.
+      const entries = harness.session.sessionManager.getEntries();
+      const failed = entries.find(entry =>
+        entry.type === "message" &&
+        entry.message.role === "assistant" &&
+        (entry.message as { stopReason?: string }).stopReason === "error");
+      expect(failed).toBeDefined();
+      expect(entries.filter(entry => entry.type === "custom_message")).toHaveLength(0);
+      expect(entries.some(entry =>
+        entry.type === "context_edit" &&
+        entry.targetId === failed?.id &&
+        entry.replacement === null)).toBe(true);
+      const projected = harness.session.sessionManager.buildSessionProjection().messages;
+      expect(projected.some(message =>
+        message.role === "assistant" && (message as { stopReason?: string }).stopReason === "error")).toBe(false);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  // An opted-in ordinary session uses the inline controller in any mode.
+  it("keeps an opted-in ordinary prompt pending through recovery", async () => {
+    const harness = await createChildHarness(
+      [
+        fauxAssistantMessage("ordinary failed", {
+          stopReason: "error",
+          errorMessage: "WebSocket closed 1000",
+        }),
+        fauxAssistantMessage("ordinary recovered"),
+      ],
+      30,
+      {
+        nativeRetryEnabled: true,
+        childMarker: false,
+        mode: "rpc",
+        mainRetryConfig: { messageFreeRetries: true },
+      },
+    );
+    try {
+      await harness.session.prompt("Task: recover the ordinary session inline");
+
+      // No extra wait: recovery completed inside the original prompt.
+      expect(harness.faux.state.callCount).toBe(2);
+      expect(harness.session.getLastAssistantText()).toBe("ordinary recovered");
+      expect(harness.session.messages.filter(message => message.role === "custom")).toHaveLength(0);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("preserves a completed tool result through a message-free retry", async () => {
+    let toolExecutionCount = 0;
+    const countedTool = defineTool({
+      name: "counted_tool",
+      label: "Counted Tool",
+      description: "Return one deterministic tool result for retry testing.",
+      parameters: Type.Object({ value: Type.String() }),
+      async execute(_toolCallId, params) {
+        toolExecutionCount++;
+        return { content: [{ type: "text", text: `tool-result:${params.value}` }], details: {} };
+      },
+    });
+    const contexts: Context[] = [];
+    const harness = await createChildHarness(
+      [
+        context => {
+          contexts.push({ ...context, messages: [...context.messages] });
+          return fauxAssistantMessage(
+            fauxToolCall("counted_tool", { value: "one" }, { id: "message-free-tool-call" }),
+            { stopReason: "toolUse" },
+          );
+        },
+        context => {
+          contexts.push({ ...context, messages: [...context.messages] });
+          return fauxAssistantMessage([], {
+            stopReason: "error",
+            errorMessage: "request ended without sending any chunks",
+          });
+        },
+        context => {
+          contexts.push({ ...context, messages: [...context.messages] });
+          return fauxAssistantMessage("recovered after completed tool");
+        },
+      ],
+      0,
+      {
+        childRetryConfig: { messageFreeRetries: true },
+        customTools: [countedTool],
+        tools: ["counted_tool"],
+      },
+    );
+    try {
+      await harness.session.prompt("Use counted_tool, then finish the task.");
+
+      expect(harness.faux.state.callCount).toBe(3);
+      expect(toolExecutionCount).toBe(1);
+      expect(roles(contexts[2])).toEqual(roles(contexts[1]));
+      expect(contexts[2]?.messages.at(-1)).toMatchObject({ role: "toolResult" });
+      expect(harness.session.messages.filter(message => message.role === "custom")).toHaveLength(0);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("stops message-free retries at the configured cap", async () => {
+    const harness = await createChildHarness(
+      [
+        fauxAssistantMessage("error one", { stopReason: "error", errorMessage: "connection error one" }),
+        fauxAssistantMessage("error two", { stopReason: "error", errorMessage: "connection error two" }),
+        fauxAssistantMessage("error three", { stopReason: "error", errorMessage: "connection error three" }),
+        fauxAssistantMessage("unexpected fourth request"),
+      ],
+      1,
+      { childRetryConfig: { baseDelayMs: 1, maxDelayMs: 1, maxRetriesAtMaxDelay: 2, messageFreeRetries: true } },
+    );
+    try {
+      await harness.session.prompt("Stop after the configured retry cap.");
+
+      expect(harness.faux.state.callCount).toBe(3);
+      expect(harness.faux.getPendingResponseCount()).toBe(1);
+      expect(harness.session.messages.filter(message => message.role === "custom")).toHaveLength(0);
+      // The final failure is reported, not omitted.
+      expect(harness.session.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "error" });
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("sends no request when abort interrupts a message-free backoff", async () => {
+    const harness = await createChildHarness(
+      [
+        fauxAssistantMessage("backoff error", {
+          stopReason: "error",
+          errorMessage: "connection error during backoff",
+        }),
+        fauxAssistantMessage("must not arrive after abort"),
+      ],
+      250,
+      { childRetryConfig: { baseDelayMs: 250, maxDelayMs: 250, messageFreeRetries: true } },
+    );
+    try {
+      const promptPromise = harness.session.prompt("Abort during message-free backoff.");
+      await harness.waitForFirstError();
+      const settled = await Promise.race([
+        harness.session.abort().then(() => true),
+        new Promise<boolean>(resolve => setTimeout(() => resolve(false), 1_000)),
+      ]);
+
+      expect(settled).toBe(true);
+      await promptPromise;
+      await new Promise(resolve => setTimeout(resolve, 300));
+      expect(harness.faux.state.callCount).toBe(1);
+      expect(harness.session.sessionManager.getEntries().some(entry => entry.type === "context_edit")).toBe(false);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  // Length continuations still need a user turn, so they keep the hidden message.
+  it("keeps the hidden continuation message for length stops", async () => {
+    const harness = await createChildHarness(
+      [
+        fauxAssistantMessage("partial answer", { stopReason: "length" }),
+        fauxAssistantMessage("completed length continuation"),
+      ],
+      0,
+      { childRetryConfig: { messageFreeRetries: true } },
+    );
+    try {
+      await harness.session.prompt("Continue the truncated answer.");
+
+      expect(harness.faux.state.callCount).toBe(2);
+      expect(harness.session.messages.filter(message => message.role === "custom")).toHaveLength(1);
+    } finally {
       await harness.close();
     }
   });

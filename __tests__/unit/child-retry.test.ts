@@ -23,6 +23,7 @@ function createFixture(
     maxDelayMs: number;
     multiplier: number;
     maxRetriesAtMaxDelay: number;
+    messageFreeRetries?: boolean;
   },
   options: { stubBackoff?: boolean } = {},
 ): Fixture {
@@ -185,5 +186,72 @@ describe("ChildRetryController retry lifecycle", () => {
 
     expect(fixture.sends).toHaveLength(1);
     expect(fixture.delays).toEqual([10, 10]);
+  });
+});
+
+describe("ChildRetryController message-free retries", () => {
+  const config = {
+    baseDelayMs: 10,
+    maxDelayMs: 1_000,
+    multiplier: 2,
+    maxRetriesAtMaxDelay: 2,
+    messageFreeRetries: true,
+  };
+  const failed = { role: "assistant", stopReason: "error", errorMessage: "connection error", content: [] };
+  /** Build a settle-boundary event whose projected context ends with `last`. */
+  const settleEvent = (last: unknown, entries: unknown[] = []) => ({
+    type: "agent_before_settle",
+    entries,
+    continue: false,
+    outcome: "error",
+    context: {
+      contextEntries: [
+        { sourceEntry: { id: "user-1" }, messages: [{ role: "user", content: "task" }] },
+        { sourceEntry: { id: "edit-0" }, messages: [] },
+        { sourceEntry: { id: "assistant-2" }, messages: [last] },
+      ],
+    },
+  });
+
+  // TEST:__tests__/unit/child-retry.test.ts[message-free boundary]
+  it("arms the settle boundary instead of sending a hidden retry message", async () => {
+    const fixture = createFixture(config);
+    await fixture.controller.handleAgentEnd(fixture.ctx);
+
+    expect(fixture.sends).toHaveLength(0);
+    expect(fixture.agent.state.messages).toHaveLength(1);
+    const prior = { type: "custom", customType: "other-extension" };
+    expect(fixture.controller.handleBeforeSettle(settleEvent(failed, [prior]))).toEqual({
+      entries: [prior, { type: "context_edit", targetId: "assistant-2", replacement: null }],
+      continue: true,
+    });
+    // One arm fulfils exactly one continuation.
+    expect(fixture.controller.handleBeforeSettle(settleEvent(failed))).toBeUndefined();
+  });
+
+  it("drops a stale arm when the context no longer ends with an error", async () => {
+    const fixture = createFixture(config);
+    await fixture.controller.handleAgentEnd(fixture.ctx);
+
+    expect(fixture.controller.handleBeforeSettle(
+      settleEvent({ role: "assistant", stopReason: "stop", content: [] }),
+    )).toBeUndefined();
+  });
+
+  it("disarms on fresh input", async () => {
+    const fixture = createFixture(config);
+    await fixture.controller.handleAgentEnd(fixture.ctx);
+    fixture.controller.handleInput();
+
+    expect(fixture.controller.handleBeforeSettle(settleEvent(failed))).toBeUndefined();
+  });
+
+  // A manual retry starts from idle, where no settle boundary will run.
+  it("keeps the hidden message for a manual retry", async () => {
+    const fixture = createFixture(config);
+    await fixture.controller.retryManually(fixture.ctx);
+
+    expect(fixture.sends).toHaveLength(1);
+    expect(fixture.controller.handleBeforeSettle(settleEvent(failed))).toBeUndefined();
   });
 });

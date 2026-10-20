@@ -16,6 +16,11 @@ import {
 export interface PiRetryConfig extends BackoffConfig {
   /** Number of failed retries allowed after the delay reaches maxDelayMs. */
   maxRetriesAtMaxDelay: number;
+  /**
+   * Retry errors by omitting the failed response and continuing the same
+   * request, instead of queueing a hidden retry message. Opt-in.
+   */
+  messageFreeRetries: boolean;
 }
 
 /**
@@ -32,6 +37,8 @@ export interface PiRetrySubagentsOverride {
   multiplier?: number;
   /** Failed child retries allowed at the maximum delay. */
   maxRetriesAtMaxDelay?: number;
+  /** Child override for message-free error retries. */
+  messageFreeRetries?: boolean;
   /** Optional policy-selection rules for effective system prompts. */
   match?: {
     /** User-provided regex rules compiled during settings resolution. */
@@ -74,6 +81,7 @@ export interface PiRetrySettings {
 export const DEFAULT_RETRY_CONFIG: PiRetryConfig = {
   ...DEFAULT_BACKOFF_CONFIG,
   maxRetriesAtMaxDelay: 3,
+  messageFreeRetries: false,
 };
 
 /** Root settings key owned by this extension. */
@@ -123,21 +131,25 @@ function readNumberSetting(
 }
 
 /**
- * Read a child enabled flag and fall back to the documented default.
+ * Read one boolean setting and fall back when it fails validation.
  *
- * @param settings Child settings namespace to inspect.
- * @param fallback Default enabled state.
+ * @param settings Settings namespace to inspect.
+ * @param key Setting name to read.
+ * @param fallback Default or inherited value.
+ * @param displayKey User-facing setting path used in warnings.
  * @returns A validated boolean.
  */
-function readEnabledSetting(
+function readBooleanSetting(
   settings: SettingsObject,
+  key: string,
   fallback: boolean,
+  displayKey = `${PI_RETRY_SETTINGS_KEY}.${key}`,
 ): boolean {
-  const value = settings.enabled;
+  const value = settings[key];
   if (value === undefined) return fallback;
   if (typeof value === "boolean") return value;
   console.warn(
-    `[pi-retry] Ignoring invalid ${PI_RETRY_SETTINGS_KEY}.subagents.enabled value: ${String(value)}`,
+    `[pi-retry] Ignoring invalid ${displayKey} value: ${String(value)}`,
   );
   return fallback;
 }
@@ -332,6 +344,11 @@ function resolveMainRetryConfig(
       DEFAULT_RETRY_CONFIG.maxRetriesAtMaxDelay,
       value => Number.isInteger(value) && value >= 1,
     ),
+    messageFreeRetries: readBooleanSetting(
+      mergedSettings,
+      "messageFreeRetries",
+      DEFAULT_RETRY_CONFIG.messageFreeRetries,
+    ),
   };
 }
 
@@ -373,7 +390,12 @@ export function resolvePiRetrySettings(
   return {
     main,
     subagents: {
-      enabled: readEnabledSetting(mergedSubagents, true),
+      enabled: readBooleanSetting(
+        mergedSubagents,
+        "enabled",
+        true,
+        `${PI_RETRY_SETTINGS_KEY}.subagents.enabled`,
+      ),
       baseDelayMs: readNumberSetting(
         mergedSubagents,
         "baseDelayMs",
@@ -401,6 +423,12 @@ export function resolvePiRetrySettings(
         main.maxRetriesAtMaxDelay,
         value => Number.isInteger(value) && value >= 1,
         `${PI_RETRY_SETTINGS_KEY}.subagents.maxRetriesAtMaxDelay`,
+      ),
+      messageFreeRetries: readBooleanSetting(
+        mergedSubagents,
+        "messageFreeRetries",
+        main.messageFreeRetries,
+        `${PI_RETRY_SETTINGS_KEY}.subagents.messageFreeRetries`,
       ),
       match: {
         systemPromptRegex,

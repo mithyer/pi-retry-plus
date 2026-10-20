@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   recordRetrySessionAgent,
   registerRetrySession,
@@ -331,6 +334,51 @@ describe("reported retry regressions", () => {
       expect(agent.prompt.mock.calls.length).toBe(attemptsBeforeManual + 1);
     } finally {
       restore();
+    }
+  });
+});
+
+describe("prompt-scoped session classification", () => {
+  // A session first classified from its startup prompt can be reclassified by
+  // the run's effective prompt; it must not keep the other policy's controller.
+  // TEST:__tests__/unit/user-retry-regression.test.ts[prompt-scoped reclassification]
+  it("replaces the main-policy controller when a later prompt matches a child rule", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-retry-classify-"));
+    const { api, handlers, manager, ctx, restore } = await setup();
+    try {
+      mkdirSync(join(root, ".pi"), { recursive: true });
+      writeFileSync(join(root, ".pi", "settings.json"), JSON.stringify({
+        piRetry: {
+          baseDelayMs: 50_000,
+          maxDelayMs: 50_000,
+          subagents: {
+            baseDelayMs: 1_000,
+            maxDelayMs: 1_000,
+            match: { systemPromptRegex: [{ pattern: "^<worker/>$", flags: "m" }] },
+          },
+        },
+      }));
+      const agent = { state: { messages: [] as any[] } };
+      recordRetrySessionAgent(manager, agent as any);
+      Object.assign(ctx, { cwd: root, mode: "print", getSystemPrompt: () => "plain prompt" });
+
+      for (const handler of handlers["session_start"] ?? []) await handler({}, ctx);
+      for (const handler of handlers["before_agent_start"] ?? []) {
+        await handler({ systemPrompt: "<worker/>" }, ctx);
+      }
+
+      (ctx.sessionManager.getEntries as any).mockReturnValue([errorEntry()]);
+      for (const handler of handlers["agent_end"] ?? []) {
+        void handler({ messages: [] }, ctx);
+      }
+      await advance(1_000);
+
+      // The child policy's 1s delay applies, not the main policy's 50s delay.
+      expect(api.sendMessage).toHaveBeenCalledTimes(1);
+      expect(api.sendMessage.mock.calls[0]![0]).toMatchObject({ customType: "pi-retry:retry" });
+    } finally {
+      restore();
+      rmSync(root, { recursive: true, force: true });
     }
   });
 });

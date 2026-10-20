@@ -139,6 +139,19 @@ export function installRetrySdkHooks(): boolean {
 }
 
 /**
+ * Check whether the SDK runs the `agent_before_settle` boundary, which
+ * message-free retries use to omit a failed response and continue.
+ *
+ * @returns True when AgentSession dispatches the settle boundary.
+ *
+ * TEST:__tests__/integration/native-child-lifecycle.test.ts[message-free retries]
+ */
+export function supportsSettleBoundary(): boolean {
+  const prototype = AgentSession.prototype as unknown as Record<PropertyKey, unknown>;
+  return typeof prototype._runBeforeSettleBoundary === "function";
+}
+
+/**
  * Resolve the Agent belonging to a session-local manager object.
  *
  * @param sessionManager Session manager object from ExtensionContext.

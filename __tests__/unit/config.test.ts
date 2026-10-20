@@ -70,12 +70,41 @@ describe("resolvePiRetrySettings", () => {
       maxDelayMs: 500,
       multiplier: 2,
       maxRetriesAtMaxDelay: 3,
+      messageFreeRetries: false,
     });
     expect(settings.subagents).toEqual({
       enabled: true,
       ...settings.main,
       match: { systemPromptRegex: [] },
     });
+  });
+
+  // TEST:__tests__/unit/config.test.ts[messageFreeRetries]
+  it("resolves the opt-in message-free retry flag with child inheritance", () => {
+    expect(resolvePiRetrySettings({}, {}).main.messageFreeRetries).toBe(false);
+
+    const inherited = resolvePiRetrySettings(
+      { piRetry: { messageFreeRetries: true } },
+      {},
+    );
+    expect(inherited.main.messageFreeRetries).toBe(true);
+    expect(inherited.subagents.messageFreeRetries).toBe(true);
+
+    const overridden = resolvePiRetrySettings(
+      { piRetry: { messageFreeRetries: true } },
+      { piRetry: { subagents: { messageFreeRetries: false } } },
+    );
+    expect(overridden.main.messageFreeRetries).toBe(true);
+    expect(overridden.subagents.messageFreeRetries).toBe(false);
+
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const invalid = resolvePiRetrySettings(
+      { piRetry: { messageFreeRetries: "yes", subagents: { messageFreeRetries: 1 } } },
+      {},
+    );
+    expect(invalid.main.messageFreeRetries).toBe(false);
+    expect(invalid.subagents.messageFreeRetries).toBe(false);
+    expect(warning).toHaveBeenCalledTimes(2);
   });
 
   // Nested project fields merge over nested global fields, then main values.
@@ -103,6 +132,7 @@ describe("resolvePiRetrySettings", () => {
       maxDelayMs: 200,
       multiplier: 2,
       maxRetriesAtMaxDelay: 7,
+      messageFreeRetries: false,
     });
     expect(settings.subagents).toEqual({
       enabled: true,
@@ -110,6 +140,7 @@ describe("resolvePiRetrySettings", () => {
       maxDelayMs: 33,
       multiplier: 1.25,
       maxRetriesAtMaxDelay: 7,
+      messageFreeRetries: false,
       match: { systemPromptRegex: [] },
     });
   });
@@ -313,6 +344,7 @@ describe("resolvePiRetryConfig", () => {
       maxDelayMs: 3_600_000,
       multiplier: 2,
       maxRetriesAtMaxDelay: 3,
+      messageFreeRetries: false,
     });
   });
 
@@ -351,6 +383,7 @@ describe("loadPiRetryConfig", () => {
       maxDelayMs: 3_600_000,
       multiplier: 2,
       maxRetriesAtMaxDelay: 3,
+      messageFreeRetries: false,
     });
   });
 

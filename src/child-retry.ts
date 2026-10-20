@@ -1,5 +1,10 @@
 import type { Agent, AgentMessage } from "@earendil-works/pi-agent-core";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type {
+  AgentBeforeSettleEvent,
+  BoundaryResult,
+  ExtensionAPI,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import {
   CONTINUATION_CUSTOM_TYPE,
   getErrorCategory,
@@ -45,6 +50,11 @@ export interface ChildRetryStatus {
  * hidden follow-up is queued, AgentSession's own post-run loop continues the
  * same transcript and retains completed tool results.
  *
+ * With `messageFreeRetries`, an automatic error retry queues no message: the
+ * same backoff ends by arming the `agent_before_settle` boundary, which omits
+ * the failed response with a durable `context_edit` and requests one
+ * continuation of the unchanged context.
+ *
  * TEST:__tests__/unit/child-retry.test.ts[ChildRetryController retry lifecycle]
  */
 export class ChildRetryController {
@@ -85,6 +95,8 @@ export class ChildRetryController {
   private lifecycleId: number | undefined;
   /** Locally monotonic lifecycle id source. */
   private nextLifecycleId = 0;
+  /** Generation of an error retry waiting for the settle boundary. */
+  private pendingBoundaryRetry: number | undefined;
 
   /**
    * Create the controller for one exact AgentSession identity.
@@ -107,9 +119,10 @@ export class ChildRetryController {
    * Inspect one awaited child agent_end event and schedule its next turn.
    *
    * @param ctx SDK context carrying the current abort signal and diagnostics UI.
+   * @param manual True for `/retry`, which runs outside an agent run.
    * @returns A promise that settles after one backoff and queue operation.
    */
-  public async handleAgentEnd(ctx: ExtensionContext): Promise<void> {
+  public async handleAgentEnd(ctx: ExtensionContext, manual = false): Promise<void> {
     if (this.closed) return;
     if (ctx.signal?.aborted) {
       this.cancel("Agent operation aborted.");
@@ -184,7 +197,7 @@ export class ChildRetryController {
     if (state.getIsRetrying()) return;
     state.startRetry(errorMsg);
     try {
-      await this.schedule("retry", ctx);
+      await this.schedule("retry", ctx, manual);
     } finally {
       state.endRetry();
     }
@@ -233,6 +246,7 @@ export class ChildRetryController {
    */
   public handleInput(): void {
     if (this.closed) return;
+    this.pendingBoundaryRetry = undefined;
     this.generation++;
     this.cancellation.abort("Fresh user input superseded the retry.");
     this.resetCounters();
@@ -247,6 +261,7 @@ export class ChildRetryController {
    */
   public cancel(reason: string): void {
     if (this.closed) return;
+    this.pendingBoundaryRetry = undefined;
     this.generation++;
     this.cancellation.abort(reason);
     this.resetCounters();
@@ -259,6 +274,7 @@ export class ChildRetryController {
   public close(): void {
     if (this.closed) return;
     this.closed = true;
+    this.pendingBoundaryRetry = undefined;
     this.generation++;
     this.cancellation.abort("Child session shut down.");
     this.resetCounters();
@@ -269,6 +285,7 @@ export class ChildRetryController {
    * Reset all counters for an explicit `/retry reset` command.
    */
   public reset(): void {
+    this.pendingBoundaryRetry = undefined;
     this.generation++;
     this.cancellation.abort("Retry state reset.");
     this.cancellation = new AbortController();
@@ -304,9 +321,10 @@ export class ChildRetryController {
   private async schedule(
     kind: ChildHiddenTurnKind,
     ctx: ExtensionContext,
+    manual = false,
   ): Promise<void> {
     if (this.closed || this.driving) return;
-    const scheduled = this.runSchedule(kind, ctx);
+    const scheduled = this.runSchedule(kind, ctx, manual);
     this.activeSchedule = scheduled;
     try {
       await scheduled;
@@ -320,10 +338,12 @@ export class ChildRetryController {
    *
    * @param kind Type of hidden turn to queue.
    * @param ctx SDK context with the active run signal.
+   * @param manual True when no agent run is active to reach the settle boundary.
    */
   private async runSchedule(
     kind: ChildHiddenTurnKind,
     ctx: ExtensionContext,
+    manual: boolean,
   ): Promise<void> {
     this.driving = true;
     const generation = this.generation;
@@ -356,10 +376,14 @@ export class ChildRetryController {
         this.maxDelayRetries++;
       }
 
+      // An automatic error retry can continue the active run without a message;
+      // a manual retry starts from idle, where only a queued message can.
+      const messageFree = kind === "retry" && !manual && this.config.messageFreeRetries === true;
       // Remove the failed response from Pi's canonical projection before retrying.
       // The helper keeps raw history intact on newer SDKs and falls back to the
-      // live Agent state on older versions.
-      if (kind === "retry") {
+      // live Agent state on older versions. The message-free path omits it
+      // durably at the settle boundary instead.
+      if (kind === "retry" && !messageFree) {
         removeErrorFromRetryContext(ctx.sessionManager, this.agent);
       }
       // The wait helper emits the initial frame and replaces it every 100ms
@@ -372,6 +396,11 @@ export class ChildRetryController {
       );
       this.clearRetryStatus(ctx);
       if (!ready || this.closed || generation !== this.generation) return;
+
+      if (messageFree) {
+        this.pendingBoundaryRetry = generation;
+        return;
+      }
 
       this.pi.sendMessage(
         {
@@ -416,7 +445,46 @@ export class ChildRetryController {
     this.reset();
     if (activeSchedule) await activeSchedule;
     if (this.closed) return;
-    await this.handleAgentEnd(ctx);
+    await this.handleAgentEnd(ctx, true);
+  }
+
+  /**
+   * Fulfil an armed message-free retry at the final settle boundary.
+   *
+   * The failed response is omitted with a durable `context_edit` (it stays in
+   * the raw session history) and Pi continues the unchanged context once. A
+   * stale arm is dropped unless the projected context still ends with an error.
+   *
+   * @param event SDK boundary event with the projected context and drafts.
+   * @returns Boundary result chaining earlier drafts, or undefined to pass.
+   *
+   * TEST:__tests__/integration/native-child-lifecycle.test.ts[message-free retries]
+   */
+  public handleBeforeSettle(event: AgentBeforeSettleEvent): BoundaryResult | undefined {
+    const armed = this.pendingBoundaryRetry;
+    this.pendingBoundaryRetry = undefined;
+    if (this.closed || armed === undefined || armed !== this.generation) return undefined;
+
+    const entries = event.context?.contextEntries ?? [];
+    for (let index = entries.length - 1; index >= 0; index--) {
+      const entry = entries[index];
+      if (!entry || entry.messages.length === 0) continue;
+      const last = entry.messages[entry.messages.length - 1] as {
+        role?: string;
+        stopReason?: string;
+      };
+      if (last.role !== "assistant" || last.stopReason !== "error") break;
+      return {
+        entries: [
+          ...(event.entries ?? []),
+          { type: "context_edit", targetId: entry.sourceEntry.id, replacement: null },
+        ],
+        continue: true,
+      };
+    }
+    // The armed retry cannot run; close its lifecycle like any other cancel.
+    this.finishLifecycle(false);
+    return undefined;
   }
 
   /**

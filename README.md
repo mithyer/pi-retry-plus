@@ -153,10 +153,30 @@ The example above waits 10 seconds before the first retry, doubles each delay, c
 | `maxDelayMs` | `60000` | Maximum delay between retries, in milliseconds |
 | `multiplier` | `2` | Exponential backoff multiplier; must be at least `1` |
 | `maxRetriesAtMaxDelay` | `3` | Failed ordinary retries allowed after the delay reaches `maxDelayMs` |
+| `messageFreeRetries` | `false` | Retry errors without a hidden retry message (see below) |
 
 `piRetry` is separate from Pi's built-in `retry` object so the two retry policies do not share ambiguous settings. The extension disables Pi's native retry scheduler while it is loaded, while preserving Pi's compaction handling, so only one retry loop owns the backoff schedule.
 
 Settings are read when the extension starts. Restart pi or use `/reload` after editing them.
+
+### Message-free error retries (opt-in)
+
+By default, each error retry queues a hidden `Retry the previous request.`
+message, which stays in the model context and the session file. With
+`"messageFreeRetries": true`, an automatic error retry instead waits out the
+backoff inside the original prompt, then uses Pi's `agent_before_settle`
+boundary to omit the failed response with a `context_edit` entry and continue
+the unchanged context. The provider receives the same request again, and the
+omission persists when the session is resumed. The failed response stays in
+the raw session history.
+
+- Max-token continuations, empty-stop nudges, and manual `/retry` still use
+  hidden messages, because they need a new user turn to continue.
+- Escape, new input, the backoff schedule, and the retry cap work as before.
+  The prompt stays busy during the backoff, so input typed then is steered
+  into the run and cancels the pending retry.
+- Requires Pi with the `agent_before_settle` boundary (0.87.0 or later). On
+  older Pi the extension warns once and keeps hidden retry messages.
 
 ---
 
@@ -166,7 +186,7 @@ Settings are read when the extension starts. Restart pi or use `/reload` after e
 2. **Check for any error** — Examine the last assistant message for `stopReason === "error"`
 3. **Blacklist check** — Skip known permanent failures (invalid API key, model not found, quota/session-limit/budget exhaustion, suspended accounts, etc.)
 4. **Categorize for messaging** — Classify into 400/413, credit, connection, or other for nice UI notifications
-5. **Retry or continue with hidden turns** — Wait with exponential backoff, then trigger a provider-valid custom user turn via `pi.sendMessage()` with `display: false` and `triggerTurn: true`
+5. **Retry or continue with hidden turns** — Wait with exponential backoff, then trigger a provider-valid custom user turn via `pi.sendMessage()` with `display: false` and `triggerTurn: true` (with `messageFreeRetries`, error retries omit the failed response and continue instead)
 6. **Valid provider context** — Hidden retry and continuation messages remain in context so providers never receive a trailing assistant message
 7. **Indefinite continuation** — Max_tokens auto-continues are uncapped; repeated `length` stops keep producing continuation turns until the model terminates normally
 8. **Empty-stop recovery** — A `stop` turn with no usable output (only thinking, or nothing at all) gets exactly one hidden "nudge" continuation, then gives up. Matches Anthropic's documented "empty responses with `end_turn`" remedy (continuation prompt in a new user message) — retrying an empty response in place doesn't help because the model has already decided it's done.
@@ -386,6 +406,12 @@ Semantics:
 - A matching rule with `enabled: false` leaves pi's native retry scheduler
   untouched; a missing, empty, malformed, or nonmatching configuration keeps
   the ordinary `pi-retry` takeover.
+- Unmatched sessions in print or JSON mode (`pi -p`, `pi --mode json`, and SDK
+  hosts that bind extensions without a mode, such as pi-subagents children)
+  retry inline with the top-level policy, inside the original prompt. These
+  hosts read the result as soon as `prompt()` settles, so a detached retry
+  would arrive too late. A matcher is only needed for a different child policy
+  or for `enabled: false`.
 - Patterns are compiled when settings resolve. Invalid syntax, unsupported or
   duplicate flags, and malformed groups warn and become no-match instead of
   matching everything.
@@ -395,4 +421,5 @@ the parent.
 
 The example pattern above matches the `<active_agent name="…"/>` line that
 `pi-subagents` prefixes to native child system prompts; substitute your own
-marker if you select child sessions differently.
+marker if you select child sessions differently. Keep the `m` flag: some
+children have a `<sub_agent_context>` block before that line.
