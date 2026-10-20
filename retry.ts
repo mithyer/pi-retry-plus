@@ -111,10 +111,42 @@ let _sessionGeneration = 0;
 
 let _terminalInputUnsubscribe: (() => void) | null = null;
 
+// 唤醒句柄:当前正在等待的退避睡眠提供它,手动 /retry 调用后立即结束等待。
+// 只有处于睡眠中时才非空;睡眠以任何方式结束都会清空它。
+// TEST:__tests__/unit/user-retry-regression.test.ts[manual retry skips the active backoff wait]
+let _wakeBackoffSleep: (() => void) | null = null;
+
+/**
+ * 让正在退避等待的自动重试循环立刻发起重试(供手动 /retry 使用)。
+ *
+ * 自动重试循环持有 _continueInProgress 互斥锁;若手动触发再去启动一个新循环,
+ * 会被互斥锁直接丢弃,表现为"/retry 没有反应"。因此这里改为唤醒已有循环的睡眠。
+ *
+ * @returns "none" 当前没有存活的自动重试循环,调用方应按原流程启动新循环;
+ *   "skipped" 已打断退避等待,循环会马上发送重试;
+ *   "running" 循环存活但不在退避等待中(重试请求正在进行),无需再做任何事。
+ */
+// TEST:__tests__/unit/user-retry-regression.test.ts[manual retry skips the active backoff wait]
+function skipLiveBackoff(): "none" | "skipped" | "running" {
+  // 与 agent_end 中"循环是否仍然有效"的判断保持一致:
+  // 会话或用户输入代数已变化、或用户已中止的循环正在退出,不能当作存活。
+  const live =
+    _continueInProgress &&
+    _continueGeneration === _sessionGeneration &&
+    _continueInputGeneration === _inputGeneration &&
+    !_userAborted;
+  if (!live) return "none";
+  if (!_wakeBackoffSleep) return "running";
+  _wakeBackoffSleep();
+  return "skipped";
+}
+
 // Interruptible sleep: polls _userAborted and _sessionGeneration every
 // 100ms. Returns true if interrupted (abort or session change), false if the
 // full delay elapsed normally. The optional callback refreshes one status-bar
 // row instead of emitting a new notification for every countdown tick.
+// A manual /retry can end the wait early through _wakeBackoffSleep; that also
+// resolves false so the caller proceeds to send the retry at once.
 function interruptibleSleep(
   ms: number,
   generation: number,
@@ -129,6 +161,22 @@ function interruptibleSleep(
     const checkInterval = 100;
     let elapsed = 0;
     onRemaining?.(ms);
+    // 统一的收尾出口:停止计时、注销唤醒句柄,再交还结果。
+    const finish = (interrupted: boolean) => {
+      clearInterval(timer);
+      if (_wakeBackoffSleep === wake) _wakeBackoffSleep = null;
+      resolve(interrupted);
+    };
+    // 手动唤醒:提前结束等待。仍要检查中止/换会话/新输入,
+    // 否则已失效的循环会被误唤醒并继续发送重试。
+    const wake = () => {
+      onRemaining?.(0);
+      finish(
+        _userAborted ||
+          _sessionGeneration !== generation ||
+          _inputGeneration !== inputGeneration,
+      );
+    };
     const timer = setInterval(() => {
       elapsed += checkInterval;
       const remainingMs = Math.max(0, ms - elapsed);
@@ -138,13 +186,12 @@ function interruptibleSleep(
         _sessionGeneration !== generation ||
         _inputGeneration !== inputGeneration
       ) {
-        clearInterval(timer);
-        resolve(true);
+        finish(true);
       } else if (remainingMs <= 0) {
-        clearInterval(timer);
-        resolve(false);
+        finish(false);
       }
     }, checkInterval);
+    _wakeBackoffSleep = wake;
   });
 }
 
@@ -670,6 +717,20 @@ export default function (pi: ExtensionAPI) {
       }
 
       // /retry (no args) - Manual trigger with auto-detection
+      //
+      // 自动重试循环正在退避等待时,不能再启动第二个循环(会被互斥锁丢弃),
+      // 而是直接打断这次等待,让它立刻发起重试。
+      // TEST:__tests__/unit/user-retry-regression.test.ts[manual retry skips the active backoff wait]
+      const liveLoop = skipLiveBackoff();
+      if (liveLoop === "skipped") {
+        ctx.ui.notify("Skipping the backoff wait - retrying now...", "info");
+        return;
+      }
+      if (liveLoop === "running") {
+        ctx.ui.notify("A retry is already in progress.", "info");
+        return;
+      }
+
       const entries = ctx.sessionManager.getEntries();
       const lastAssistant = getLastAssistantMessage(entries);
 

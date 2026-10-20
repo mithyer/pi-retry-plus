@@ -231,6 +231,83 @@ describe("reported retry regressions", () => {
     }
   });
 
+  // 退避等待中调用 /retry:应打断等待并马上重试,而不是被互斥锁静默丢弃。
+  // TEST target: retry.ts[skipLiveBackoff, interruptibleSleep]
+  it("manual retry skips the active backoff wait", async () => {
+    const { commands, handlers, manager, ctx, restore, ui } = await setup();
+    try {
+      const agent = attachAgent(manager, currentAgent => {
+        currentAgent.state.messages = [
+          { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] },
+        ];
+      });
+      (ctx.sessionManager.getEntries as any).mockReturnValue([errorEntry()]);
+      for (const handler of handlers["agent_end"] ?? []) {
+        void handler({ messages: [] }, ctx);
+      }
+
+      // 首次退避为 2s;走到一半时仍在等待,尚未发送重试。
+      await advance(1_000);
+      expect(agent.prompt).not.toHaveBeenCalled();
+
+      await commands["retry"]!.handler([], ctx);
+      expect(ui.notify).toHaveBeenCalledWith(
+        expect.stringContaining("Skipping the backoff wait"),
+        "info",
+      );
+      // 远小于剩余的 1s,也应已经发送了重试,且只发送一次。
+      await advance(300);
+      expect(agent.prompt).toHaveBeenCalledTimes(1);
+      expect(ui.setStatus).toHaveBeenLastCalledWith("pi-retry-backoff", undefined);
+
+      // 原本的倒计时到点后也不能再重复发送。
+      await advance(3_000);
+      expect(agent.prompt).toHaveBeenCalledTimes(1);
+    } finally {
+      restore();
+    }
+  });
+
+  // 重试已经发出、正在执行时调用 /retry:不重复触发,并给用户明确反馈。
+  // TEST target: retry.ts[skipLiveBackoff]
+  it("reports an already running retry instead of ignoring /retry silently", async () => {
+    const { commands, handlers, manager, ctx, restore, ui } = await setup();
+    try {
+      let finishTurn: (() => void) | undefined;
+      const agent = attachAgent(manager, currentAgent => {
+        currentAgent.state.messages = [
+          { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] },
+        ];
+      });
+      // 让隐藏重试回合保持“进行中”,直到测试主动放行。
+      let firstIdleCall = true;
+      agent.waitForIdle.mockImplementation(() => {
+        if (firstIdleCall) {
+          firstIdleCall = false;
+          return Promise.resolve();
+        }
+        return new Promise<void>(resolve => {
+          finishTurn = resolve;
+        });
+      });
+      (ctx.sessionManager.getEntries as any).mockReturnValue([errorEntry()]);
+      for (const handler of handlers["agent_end"] ?? []) {
+        void handler({ messages: [] }, ctx);
+      }
+      await advance(2_300);
+      expect(agent.prompt).toHaveBeenCalledTimes(1);
+
+      await commands["retry"]!.handler([], ctx);
+      expect(ui.notify).toHaveBeenCalledWith("A retry is already in progress.", "info");
+      expect(agent.prompt).toHaveBeenCalledTimes(1);
+
+      finishTurn?.();
+      await advance(100);
+    } finally {
+      restore();
+    }
+  });
+
   // The ordinary driver already owns a completed loop before manual retry starts.
   // TEST:__tests__/unit/user-retry-regression.test.ts[manual retry after ordinary cap]
   it("allows manual retry after the ordinary retry cap", async () => {
