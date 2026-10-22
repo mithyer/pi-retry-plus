@@ -121,7 +121,7 @@ Once loaded, the extension **automatically** detects and retries all errors.
 
 | Command | Description |
 |---------|-------------|
-| `/retry` | Manually trigger immediate retry (auto-detects: 400/413, credit, connection, max_tokens, or any other error) |
+| `/retry` | Manually trigger immediate retry (auto-detects: 400/413, credit, connection, max_tokens, or any other error). If an automatic retry is currently sleeping in backoff, `/retry` cuts that wait short and sends the retry right away instead of queueing a second loop. |
 | `/retry status` | Show current retry diagnostics for all error types + continuation state |
 | `/retry reset` | Reset all retry counters and state |
 

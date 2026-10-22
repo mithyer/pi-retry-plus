@@ -27,6 +27,7 @@ import {
   RetryState,
 } from "./retry-logic.js";
 import type { PiRetrySubagentsConfig } from "./config.js";
+import { removeErrorFromRetryContext } from "./session-registry.js";
 
 /** The hidden turn kinds that can continue an owned child prompt. */
 export type ChildHiddenTurnKind = "retry" | "continue" | "empty";
@@ -378,10 +379,13 @@ export class ChildRetryController {
       // An automatic error retry can continue the active run without a message;
       // a manual retry starts from idle, where only a queued message can.
       const messageFree = kind === "retry" && !manual && this.config.messageFreeRetries === true;
-      // Removing only a trailing error mirrors SDK native retry and preserves
-      // every preceding assistant tool call and tool result in the transcript.
-      // The message-free path omits it durably at the settle boundary instead.
-      if (kind === "retry" && !messageFree) this.removeErrorFromAgentState();
+      // Remove the failed response from Pi's canonical projection before retrying.
+      // The helper keeps raw history intact on newer SDKs and falls back to the
+      // live Agent state on older versions. The message-free path omits it
+      // durably at the settle boundary instead.
+      if (kind === "retry" && !messageFree) {
+        removeErrorFromRetryContext(ctx.sessionManager, this.agent);
+      }
       // The wait helper emits the initial frame and replaces it every 100ms
       // instead of adding a new retry notification line.
       const ready = await this.waitForBackoff(
@@ -533,16 +537,6 @@ export class ChildRetryController {
   }
 
   /**
-   * Remove only an error assistant response from this child's live state.
-   */
-  private removeErrorFromAgentState(): void {
-    const messages = this.agent.state.messages;
-    const last = messages[messages.length - 1];
-    if (last?.role === "assistant" && last.stopReason === "error") {
-      this.agent.state.messages = messages.slice(0, -1);
-    }
-  }
-
   /**
    * Reset retry counters after a successful terminal assistant response.
    */
