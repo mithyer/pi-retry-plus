@@ -35,6 +35,7 @@ import {
   registerRetrySession,
   supportsSettleBoundary,
   unregisterRetrySession,
+  waitForSessionIdle,
 } from "./src/session-registry.js";
 
 const RETRY_STARTED_EVENT = "pi-retry:started";
@@ -1072,11 +1073,14 @@ export default function (pi: ExtensionAPI) {
             { triggerTurn: true, deliverAs: "followUp" },
           );
 
-          // sendMessage is fire-and-forget, but AgentSession publishes the
-          // low-level run synchronously before returning. Waiting on Agent
-          // keeps this retry loop intact without bypassing session state.
+          // sendMessage is fire-and-forget. AgentSession marks itself busy
+          // synchronously, but the low-level Agent run only appears after
+          // _prepareRun() finishes, so Agent.waitForIdle() can return before the
+          // hidden turn starts. That made the loop read the stale tool result,
+          // treat the retry as complete, and restart backoff from attempt 0.
+          // Wait on the session lifecycle instead (falls back to Agent).
           await Promise.resolve();
-          await myAgent.waitForIdle();
+          await waitForSessionIdle(sessionManager, myAgent);
         } catch {
           return;
         }
