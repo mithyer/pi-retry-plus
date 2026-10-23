@@ -42,18 +42,6 @@ function errorEntry(stopReason = "error") {
 }
 
 /**
- * Deliver agent_start to the extension like AgentSession does when a run begins.
- * The retry loop waits for it before it waits for the hidden turn to finish.
- *
- * @param handlers Event handlers registered by the extension under test.
- */
-function emitAgentStart(handlers: Record<string, Function[]>): void {
-  for (const handler of handlers["agent_start"] ?? []) {
-    void handler({ type: "agent_start" }, {});
-  }
-}
-
-/**
  * Create the smallest ExtensionAPI surface used by the ordinary retry driver.
  *
  * @returns Fake API, event handlers, and registered commands.
@@ -70,7 +58,6 @@ function createApi() {
       commands[name] = options;
     },
     sendMessage: vi.fn((message: unknown) => {
-      emitAgentStart(handlers);
       void activeAgent?.prompt([message]).catch(() => undefined);
     }),
   } as any;
@@ -168,6 +155,36 @@ describe("reported retry regressions", () => {
       restore();
     }
   });
+  // An empty stop is not a real success: it must not restart the error backoff,
+  // otherwise a model that keeps answering with nothing would retry at the base delay forever.
+  // TEST target: retry.ts[successGeneration]
+  it("keeps growing the backoff when an empty stop precedes the next error in the same run", async () => {
+    const { handlers, manager, ctx, restore, ui } = await setup();
+    try {
+      let calls = 0;
+      const agent = attachAgent(manager, currentAgent => {
+        calls++;
+        if (calls === 1) {
+          // A turn that ended with thinking only (no usable output), then a request error.
+          for (const handler of handlers.turn_end ?? []) {
+            void handler({ message: { role: "assistant", stopReason: "stop", content: [{ type: "thinking", thinking: "..." }] } }, ctx);
+          }
+          currentAgent.state.messages = [errorEntry().message];
+        } else {
+          currentAgent.state.messages = [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] }];
+        }
+      });
+      manager.getEntries.mockReturnValue([errorEntry()]);
+      for (const handler of handlers.agent_end ?? []) void handler({ messages: [] }, ctx);
+      // The first retry fires after 2s; the second must wait the grown 4s delay, so it
+      // has not fired yet at 4.1s (it would have, at 2s + 2s, if the backoff restarted).
+      await advance(4_100);
+      expect(agent.prompt).toHaveBeenCalledTimes(1);
+      expect(ui.setStatus).toHaveBeenCalledWith("pi-retry-backoff", expect.stringContaining("Retry attempt 2"));
+    } finally {
+      restore();
+    }
+  });
   // A continuation is not an ordinary retry and must not consume its exponential slot.
   it("keeps ordinary retry backoff independent from a max-token continuation", async () => {
     const { api, handlers, manager, ctx, restore } = await setup();
@@ -186,7 +203,6 @@ describe("reported retry regressions", () => {
       });
       api.sendMessage.mockImplementation((message: any) => {
         sent.push({ kind: message.customType, at: Date.now() });
-        emitAgentStart(handlers);
         void agent.prompt();
       });
       (ctx.sessionManager.getEntries as any).mockReturnValue([errorEntry()]);
@@ -234,7 +250,8 @@ describe("reported retry regressions", () => {
     }
   });
 
-  // 退避等待中调用 /retry:应打断等待并马上重试,而不是被互斥锁静默丢弃。
+  // /retry during a backoff wait must end the wait and retry at once instead of
+  // being silently dropped by the mutex.
   // TEST target: retry.ts[skipLiveBackoff, interruptibleSleep]
   it("manual retry skips the active backoff wait", async () => {
     const { commands, handlers, manager, ctx, restore, ui } = await setup();
@@ -249,7 +266,7 @@ describe("reported retry regressions", () => {
         void handler({ messages: [] }, ctx);
       }
 
-      // 首次退避为 2s;走到一半时仍在等待,尚未发送重试。
+      // The first backoff is 2s; halfway through it is still waiting and no retry was sent.
       await advance(1_000);
       expect(agent.prompt).not.toHaveBeenCalled();
 
@@ -258,12 +275,12 @@ describe("reported retry regressions", () => {
         expect.stringContaining("Skipping the backoff wait"),
         "info",
       );
-      // 远小于剩余的 1s,也应已经发送了重试,且只发送一次。
+      // Well under the remaining 1s, the retry must already be sent, exactly once.
       await advance(300);
       expect(agent.prompt).toHaveBeenCalledTimes(1);
       expect(ui.setStatus).toHaveBeenLastCalledWith("pi-retry-backoff", undefined);
 
-      // 原本的倒计时到点后也不能再重复发送。
+      // The original countdown expiring must not send a duplicate.
       await advance(3_000);
       expect(agent.prompt).toHaveBeenCalledTimes(1);
     } finally {
@@ -271,7 +288,7 @@ describe("reported retry regressions", () => {
     }
   });
 
-  // 重试已经发出、正在执行时调用 /retry:不重复触发,并给用户明确反馈。
+  // /retry while a retry is already running must not fire again and must tell the user.
   // TEST target: retry.ts[skipLiveBackoff]
   it("reports an already running retry instead of ignoring /retry silently", async () => {
     const { commands, handlers, manager, ctx, restore, ui } = await setup();
@@ -282,7 +299,7 @@ describe("reported retry regressions", () => {
           { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] },
         ];
       });
-      // 让隐藏重试回合保持“进行中”,直到测试主动放行。
+      // Keep the hidden retry turn "in progress" until the test releases it.
       let firstIdleCall = true;
       agent.waitForIdle.mockImplementation(() => {
         if (firstIdleCall) {

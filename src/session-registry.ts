@@ -263,13 +263,14 @@ export function recordRetrySessionAgent(
  * Pi 0.87+ builds provider context from SessionManager projections rather than
  * from direct assignments to `agent.state.messages`. Its private recovery hook
  * records a context edit while retaining the failed response in raw history;
- * older SDKs and lightweight fixtures fall back to the former live-state edit.
+ * older SDKs, lightweight fixtures, and a throwing hook fall back to the former
+ * live-state edit.
  *
  * @param sessionManager Session manager identity exposed by ExtensionContext.
  * @param agent Agent whose trailing response is being retried.
  * @returns Nothing; the response is omitted from the next provider projection.
  *
- * TEST:__tests__/unit/session-registry.test.ts[uses canonical retry omission]
+ * TEST:__tests__/unit/session-registry.test.ts[uses canonical retry omission, falls back when the canonical omission hook throws]
  */
 export function removeErrorFromRetryContext(
   sessionManager: unknown,
@@ -286,10 +287,17 @@ export function removeErrorFromRetryContext(
     : undefined;
   const omitRecoveryAttempt = record?.session._omitRecoveryAttempt;
   if (record && typeof omitRecoveryAttempt === "function") {
-    omitRecoveryAttempt.call(record.session, lastMessage);
-    return;
+    try {
+      omitRecoveryAttempt.call(record.session, lastMessage);
+      return;
+    } catch {
+      // The private hook can throw (for example when a projected message has no
+      // source entry). The retry loop is started with `void`, so a throw here would
+      // become an unhandled rejection; fall back to the live-state edit instead.
+    }
   }
 
-  // Compatibility path for pi versions before canonical SessionManager context.
+  // Compatibility path for pi versions before canonical SessionManager context,
+  // and fallback when the canonical hook throws.
   agent.state.messages = messages.slice(0, -1);
 }

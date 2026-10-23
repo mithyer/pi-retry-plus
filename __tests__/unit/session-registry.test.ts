@@ -86,6 +86,37 @@ describe("session registry ownership", () => {
     expect(omitRecoveryAttempt).toHaveBeenCalledWith(failedMessage);
     expect(agent.state.messages).toEqual([failedMessage]);
   });
+
+  // The private hook can throw; the retry loop must not see that as an unhandled rejection.
+  // TEST:__tests__/unit/session-registry.test.ts[falls back when the canonical omission hook throws]
+  it("falls back to the live-state edit when the canonical omission hook throws", () => {
+    const manager = {};
+    const keptMessage = { role: "user", content: "hello" };
+    const failedMessage = {
+      role: "assistant",
+      stopReason: "error",
+      errorMessage: "transient connection error",
+    };
+    const agent = { state: { messages: [keptMessage, failedMessage] } } as any;
+    const owner = {};
+    const omitRecoveryAttempt = vi.fn(() => {
+      throw new Error(
+        "Cannot persist recovery omission because a projected message has no source entry",
+      );
+    });
+    recordRetrySessionAgent(manager, agent, {
+      sessionManager: manager,
+      agent,
+      _omitRecoveryAttempt: omitRecoveryAttempt,
+    });
+    registrations.push({ manager, owner });
+
+    expect(() => removeErrorFromRetryContext(manager, agent)).not.toThrow();
+
+    expect(omitRecoveryAttempt).toHaveBeenCalledTimes(1);
+    expect(agent.state.messages).toEqual([keptMessage]);
+  });
+
   // Session-manager WeakMap keys keep sibling main/child sessions isolated.
   it("isolates ownership and Agent identity between sibling sessions", () => {
     const first = createRegistration();
