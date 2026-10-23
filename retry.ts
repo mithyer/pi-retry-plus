@@ -961,9 +961,12 @@ export default function (pi: ExtensionAPI) {
     try {
       emitRetryLifecycleEvent(RETRY_STARTED_EVENT, retryLifecycleId);
 
-      // Wait for the current run to finish (activeRun resolves in
-      // finishRun() after agent_end listeners return).
-      await myAgent.waitForIdle();
+      // Wait for the whole session lifecycle, not just the low-level run. The
+      // Agent run resolves once agent_end listeners return, but AgentSession
+      // then emits agent_settled. A hidden message sent while that event is
+      // still being emitted is deferred, so the wait after the send would
+      // return at once and the backoff would restart from attempt 0.
+      await waitForSessionIdle(sessionManager, myAgent);
 
       // AgentSession clears its outer lifecycle immediately after Agent's
       // active run resolves. Yield to the next macrotask so the detached path
