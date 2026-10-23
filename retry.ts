@@ -34,6 +34,7 @@ import {
   registerRetrySession,
   supportsSettleBoundary,
   unregisterRetrySession,
+  waitForSessionIdle,
 } from "./src/session-registry.js";
 
 const RETRY_STARTED_EVENT = "pi-retry:started";
@@ -365,7 +366,7 @@ export default function (pi: ExtensionAPI) {
   ): void {
     const agent = getSessionAgent(ctx.sessionManager);
     if (!agent) return;
-    void triggerInvisibleContinue(kind, agent);
+    void triggerInvisibleContinue(kind, agent, ctx.sessionManager);
   }
 
   pi.on("before_agent_start", (event, ctx) => {
@@ -860,7 +861,11 @@ export default function (pi: ExtensionAPI) {
   // agent.state.messages so the LLM receives a clean context (same
   // technique as the built-in retry's _prepareRetry).
   // TEST:__tests__/unit/user-retry-regression.test.ts[reported retry regressions]
-  async function triggerInvisibleContinue(initialKind: HiddenTurnKind, myAgent: Agent) {
+  async function triggerInvisibleContinue(
+    initialKind: HiddenTurnKind,
+    myAgent: Agent,
+    sessionManager?: unknown,
+  ) {
     // Keep the Agent that started this loop. Session replacement is handled by
     // the ordinary generation and exact session-manager ownership checks.
     if (!myAgent) return;
@@ -986,11 +991,14 @@ export default function (pi: ExtensionAPI) {
             { triggerTurn: true, deliverAs: "followUp" },
           );
 
-          // sendMessage is fire-and-forget, but AgentSession publishes the
-          // low-level run synchronously before returning. Waiting on Agent
-          // keeps this retry loop intact without bypassing session state.
+          // sendMessage is fire-and-forget. AgentSession marks itself busy
+          // synchronously, but the low-level Agent run only appears after
+          // _prepareRun() finishes, so Agent.waitForIdle() can return before the
+          // hidden turn starts. That made the loop read the stale tool result,
+          // treat the retry as complete, and restart backoff from attempt 0.
+          // Wait on the session lifecycle instead (falls back to Agent).
           await Promise.resolve();
-          await myAgent.waitForIdle();
+          await waitForSessionIdle(sessionManager, myAgent);
         } catch {
           return;
         }

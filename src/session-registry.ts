@@ -15,6 +15,8 @@ type AgentSessionLike = {
   agent?: Agent;
   /** Native retry method wrapped through a structural SDK view. */
   _prepareRetry?: (message: unknown) => Promise<boolean>;
+  /** Resolves once the whole session lifecycle (not just the Agent run) is idle. */
+  waitForIdle?: () => Promise<void>;
 };
 
 /** The SDK identity captured before an extension registers its own policy. */
@@ -158,6 +160,36 @@ export function supportsSettleBoundary(): boolean {
 export function getSessionAgent(sessionManager: unknown): Agent | undefined {
   if (!sessionManager || typeof sessionManager !== "object") return undefined;
   return sharedRegistry().records.get(sessionManager)?.agent;
+}
+
+/**
+ * Wait until a session has finished the run it just started.
+ *
+ * `Agent.waitForIdle()` only covers the low-level run, which is published after
+ * `AgentSession._prepareRun()` completes. Right after `pi.sendMessage()` the
+ * Agent can therefore still look idle, so a retry loop that waits on it moves
+ * on before the hidden turn even starts and loses its backoff state.
+ * `AgentSession.waitForIdle()` is flagged busy synchronously by the send and
+ * also settles when the run fails to start, so it is the correct barrier.
+ *
+ * @param sessionManager Session manager object from ExtensionContext.
+ * @param agent Agent the caller is driving; used as the fallback barrier.
+ * @returns Resolves when the session (or, without a mapped session, the Agent) is idle.
+ */
+export async function waitForSessionIdle(
+  sessionManager: unknown,
+  agent: Agent,
+): Promise<void> {
+  const record = sessionManager && typeof sessionManager === "object"
+    ? sharedRegistry().records.get(sessionManager)
+    : undefined;
+  // Only trust the session when it still owns this exact Agent; a replaced
+  // session must not make an old loop wait on a different lifecycle.
+  if (record && record.agent === agent && typeof record.session.waitForIdle === "function") {
+    await record.session.waitForIdle();
+    return;
+  }
+  await agent.waitForIdle();
 }
 
 /**
