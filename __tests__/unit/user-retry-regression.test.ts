@@ -130,6 +130,61 @@ async function advance(ms: number) {
 }
 
 describe("reported retry regressions", () => {
+  // Exercise success inside a run: waitForIdle only sees the later request error.
+  it("restarts ordinary backoff after tool success inside the same run", async () => {
+    const { handlers, manager, ctx, restore, ui } = await setup();
+    try {
+      let calls = 0;
+      const agent = attachAgent(manager, currentAgent => {
+        calls++;
+        if (calls === 1) {
+          for (const handler of handlers.turn_end ?? []) {
+            void handler({ message: { role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", id: "t", name: "read", arguments: {} }] } }, ctx);
+          }
+          currentAgent.state.messages = [errorEntry().message];
+        } else {
+          currentAgent.state.messages = [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] }];
+        }
+      });
+      manager.getEntries.mockReturnValue([errorEntry()]);
+      for (const handler of handlers.agent_end ?? []) void handler({ messages: [] }, ctx);
+      await advance(4_100);
+      expect(agent.prompt).toHaveBeenCalledTimes(2);
+      expect(ui.setStatus).not.toHaveBeenCalledWith("pi-retry-backoff", expect.stringContaining("Retry attempt 2"));
+    } finally {
+      restore();
+    }
+  });
+  // An empty stop is not a real success: it must not restart the error backoff,
+  // otherwise a model that keeps answering with nothing would retry at the base delay forever.
+  // TEST target: retry.ts[successGeneration]
+  it("keeps growing the backoff when an empty stop precedes the next error in the same run", async () => {
+    const { handlers, manager, ctx, restore, ui } = await setup();
+    try {
+      let calls = 0;
+      const agent = attachAgent(manager, currentAgent => {
+        calls++;
+        if (calls === 1) {
+          // A turn that ended with thinking only (no usable output), then a request error.
+          for (const handler of handlers.turn_end ?? []) {
+            void handler({ message: { role: "assistant", stopReason: "stop", content: [{ type: "thinking", thinking: "..." }] } }, ctx);
+          }
+          currentAgent.state.messages = [errorEntry().message];
+        } else {
+          currentAgent.state.messages = [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] }];
+        }
+      });
+      manager.getEntries.mockReturnValue([errorEntry()]);
+      for (const handler of handlers.agent_end ?? []) void handler({ messages: [] }, ctx);
+      // The first retry fires after 2s; the second must wait the grown 4s delay, so it
+      // has not fired yet at 4.1s (it would have, at 2s + 2s, if the backoff restarted).
+      await advance(4_100);
+      expect(agent.prompt).toHaveBeenCalledTimes(1);
+      expect(ui.setStatus).toHaveBeenCalledWith("pi-retry-backoff", expect.stringContaining("Retry attempt 2"));
+    } finally {
+      restore();
+    }
+  });
   // A continuation is not an ordinary retry and must not consume its exponential slot.
   it("keeps ordinary retry backoff independent from a max-token continuation", async () => {
     const { api, handlers, manager, ctx, restore } = await setup();
@@ -190,6 +245,84 @@ describe("reported retry regressions", () => {
         "info",
       );
       expect(agent.prompt).toHaveBeenCalledTimes(1);
+    } finally {
+      restore();
+    }
+  });
+
+  // /retry during a backoff wait must end the wait and retry at once instead of
+  // being silently dropped by the mutex.
+  // TEST target: retry.ts[skipLiveBackoff, interruptibleSleep]
+  it("manual retry skips the active backoff wait", async () => {
+    const { commands, handlers, manager, ctx, restore, ui } = await setup();
+    try {
+      const agent = attachAgent(manager, currentAgent => {
+        currentAgent.state.messages = [
+          { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] },
+        ];
+      });
+      (ctx.sessionManager.getEntries as any).mockReturnValue([errorEntry()]);
+      for (const handler of handlers["agent_end"] ?? []) {
+        void handler({ messages: [] }, ctx);
+      }
+
+      // The first backoff is 2s; halfway through it is still waiting and no retry was sent.
+      await advance(1_000);
+      expect(agent.prompt).not.toHaveBeenCalled();
+
+      await commands["retry"]!.handler([], ctx);
+      expect(ui.notify).toHaveBeenCalledWith(
+        expect.stringContaining("Skipping the backoff wait"),
+        "info",
+      );
+      // Well under the remaining 1s, the retry must already be sent, exactly once.
+      await advance(300);
+      expect(agent.prompt).toHaveBeenCalledTimes(1);
+      expect(ui.setStatus).toHaveBeenLastCalledWith("pi-retry-backoff", undefined);
+
+      // The original countdown expiring must not send a duplicate.
+      await advance(3_000);
+      expect(agent.prompt).toHaveBeenCalledTimes(1);
+    } finally {
+      restore();
+    }
+  });
+
+  // /retry while a retry is already running must not fire again and must tell the user.
+  // TEST target: retry.ts[skipLiveBackoff]
+  it("reports an already running retry instead of ignoring /retry silently", async () => {
+    const { commands, handlers, manager, ctx, restore, ui } = await setup();
+    try {
+      let finishTurn: (() => void) | undefined;
+      const agent = attachAgent(manager, currentAgent => {
+        currentAgent.state.messages = [
+          { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] },
+        ];
+      });
+      // Keep the hidden retry turn "in progress" until the test releases it.
+      let firstIdleCall = true;
+      agent.waitForIdle.mockImplementation(() => {
+        if (firstIdleCall) {
+          firstIdleCall = false;
+          return Promise.resolve();
+        }
+        return new Promise<void>(resolve => {
+          finishTurn = resolve;
+        });
+      });
+      (ctx.sessionManager.getEntries as any).mockReturnValue([errorEntry()]);
+      for (const handler of handlers["agent_end"] ?? []) {
+        void handler({ messages: [] }, ctx);
+      }
+      await advance(2_300);
+      expect(agent.prompt).toHaveBeenCalledTimes(1);
+
+      await commands["retry"]!.handler([], ctx);
+      expect(ui.notify).toHaveBeenCalledWith("A retry is already in progress.", "info");
+      expect(agent.prompt).toHaveBeenCalledTimes(1);
+
+      finishTurn?.();
+      await advance(100);
     } finally {
       restore();
     }

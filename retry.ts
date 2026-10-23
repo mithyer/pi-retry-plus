@@ -31,6 +31,7 @@ import {
   getRetrySession,
   getSessionAgent,
   installRetrySdkHooks,
+  removeErrorFromRetryContext,
   registerRetrySession,
   supportsSettleBoundary,
   unregisterRetrySession,
@@ -74,8 +75,8 @@ const sdkHooksSupported = installRetrySdkHooks();
  *     It fires triggerInvisibleContinue() immediately, keeping processEvents
  *     unblocked so the agent can finish its run and become idle.
  *   - triggerInvisibleContinue() owns the retry loop: it waits for idle,
- *     removes error assistant messages from live state, queues a hidden
- *     AgentSession turn, and checks the result. On error it sleeps outside
+ *     omits failed responses from Pi's canonical retry projection, queues a
+ *     hidden AgentSession turn, and checks the result. On error it sleeps outside
  *     processEvents and retries. On success or user abort the loop exits.
  */
 
@@ -117,10 +118,48 @@ let _warnedMessageFreeUnsupported = false;
 
 let _terminalInputUnsubscribe: (() => void) | null = null;
 
+// Wake handle supplied by the backoff sleep that is currently waiting; a manual
+// /retry calls it to end the wait at once. Non-null only while a sleep is in
+// progress, and cleared whenever the sleep ends for any reason.
+// TEST:__tests__/unit/user-retry-regression.test.ts[manual retry skips the active backoff wait]
+let _wakeBackoffSleep: (() => void) | null = null;
+
+/**
+ * Make an automatic retry loop that is sleeping in backoff retry right away
+ * (used by a manual /retry).
+ *
+ * The automatic loop holds the _continueInProgress mutex, so starting a second
+ * loop from a manual trigger would be dropped by that mutex and /retry would
+ * appear to do nothing. Waking the existing loop's sleep avoids that.
+ *
+ * @returns "none" when no automatic retry loop is alive, so the caller should
+ *   start a new loop as usual;
+ *   "skipped" when the backoff wait was cut short and the loop sends the retry now;
+ *   "running" when the loop is alive but not in backoff (a retry request is in
+ *   flight), so nothing more needs to be done.
+ */
+// TEST:__tests__/unit/user-retry-regression.test.ts[manual retry skips the active backoff wait]
+function skipLiveBackoff(): "none" | "skipped" | "running" {
+  // Keep this consistent with the "is the loop still valid" check in agent_end:
+  // a loop whose session or input generation changed, or that the user has
+  // aborted, is on its way out and must not be treated as alive.
+  const live =
+    _continueInProgress &&
+    _continueGeneration === _sessionGeneration &&
+    _continueInputGeneration === _inputGeneration &&
+    !_userAborted;
+  if (!live) return "none";
+  if (!_wakeBackoffSleep) return "running";
+  _wakeBackoffSleep();
+  return "skipped";
+}
+
 // Interruptible sleep: polls _userAborted and _sessionGeneration every
 // 100ms. Returns true if interrupted (abort or session change), false if the
 // full delay elapsed normally. The optional callback refreshes one status-bar
 // row instead of emitting a new notification for every countdown tick.
+// A manual /retry can end the wait early through _wakeBackoffSleep; that also
+// resolves false so the caller proceeds to send the retry at once.
 function interruptibleSleep(
   ms: number,
   generation: number,
@@ -135,6 +174,23 @@ function interruptibleSleep(
     const checkInterval = 100;
     let elapsed = 0;
     onRemaining?.(ms);
+    // Single exit path: stop the timer, unregister the wake handle, then report the result.
+    const finish = (interrupted: boolean) => {
+      clearInterval(timer);
+      if (_wakeBackoffSleep === wake) _wakeBackoffSleep = null;
+      resolve(interrupted);
+    };
+    // Manual wake: end the wait early. Abort, session change and new input must
+    // still be checked, otherwise a loop that is no longer valid would be woken
+    // up and go on to send a retry.
+    const wake = () => {
+      onRemaining?.(0);
+      finish(
+        _userAborted ||
+          _sessionGeneration !== generation ||
+          _inputGeneration !== inputGeneration,
+      );
+    };
     const timer = setInterval(() => {
       elapsed += checkInterval;
       const remainingMs = Math.max(0, ms - elapsed);
@@ -144,26 +200,13 @@ function interruptibleSleep(
         _sessionGeneration !== generation ||
         _inputGeneration !== inputGeneration
       ) {
-        clearInterval(timer);
-        resolve(true);
+        finish(true);
       } else if (remainingMs <= 0) {
-        clearInterval(timer);
-        resolve(false);
+        finish(false);
       }
     }, checkInterval);
+    _wakeBackoffSleep = wake;
   });
-}
-
-// Remove the error assistant message at the end of agent state, if present.
-// Same technique used by the built-in retry in _prepareRetry — the error
-// message stays in the session journal for history but is removed from the
-// agent's live transcript so the LLM receives a clean context on retry.
-function removeErrorFromAgentState(agent: Agent): void {
-  const messages = agent.state.messages;
-  const lastMsg = messages[messages.length - 1];
-  if (lastMsg?.role === 'assistant' && lastMsg.stopReason === 'error') {
-    agent.state.messages = messages.slice(0, -1);
-  }
 }
 
 type HiddenTurnKind = "retry" | "continue" | "empty";
@@ -242,6 +285,9 @@ function readEffectiveSystemPrompt(ctx: { getSystemPrompt?: () => string }): str
 export default function (pi: ExtensionAPI) {
   let _notifyFn: ((message: string, level: "info" | "warning" | "error") => void) | null = null;
   let _setStatusFn: ((text: string | undefined) => void) | null = null;
+  // Successful turns can occur inside a run before waitForIdle observes its final error.
+  // TEST:__tests__/unit/user-retry-regression.test.ts[restarts ordinary backoff after tool success inside the same run]
+  let successGeneration = 0;
   let retryConfig = { ...DEFAULT_RETRY_CONFIG };
   const owner = pi as unknown as object;
   // Policy source of each inline controller, so a session reclassified between
@@ -363,9 +409,10 @@ export default function (pi: ExtensionAPI) {
     kind: HiddenTurnKind,
     ctx: { sessionManager?: unknown },
   ): void {
-    const agent = getSessionAgent(ctx.sessionManager);
+    const sessionManager = ctx.sessionManager;
+    const agent = getSessionAgent(sessionManager);
     if (!agent) return;
-    void triggerInvisibleContinue(kind, agent);
+    void triggerInvisibleContinue(kind, agent, sessionManager);
   }
 
   pi.on("before_agent_start", (event, ctx) => {
@@ -422,6 +469,10 @@ export default function (pi: ExtensionAPI) {
     }
     if (msg.role === "assistant" && msg.stopReason !== "error") {
       if (msg.stopReason !== "length") {
+        // Tell the detached retry driver that a real success happened. An empty
+        // stop is not one: it is retried by a nudge, so it must not restart the
+        // error backoff. The counters below keep their original behaviour.
+        if (!hasEmptyStop(msg)) successGeneration++;
         // Normal completion — reset everything including continuation count
         state400.succeed();
         stateCredit.succeed();
@@ -683,6 +734,21 @@ export default function (pi: ExtensionAPI) {
       }
 
       // /retry (no args) - Manual trigger with auto-detection
+      //
+      // While the automatic retry loop sleeps in backoff, a second loop cannot be
+      // started (the mutex would drop it); cut the wait short so the existing
+      // loop retries immediately.
+      // TEST:__tests__/unit/user-retry-regression.test.ts[manual retry skips the active backoff wait]
+      const liveLoop = skipLiveBackoff();
+      if (liveLoop === "skipped") {
+        ctx.ui.notify("Skipping the backoff wait - retrying now...", "info");
+        return;
+      }
+      if (liveLoop === "running") {
+        ctx.ui.notify("A retry is already in progress.", "info");
+        return;
+      }
+
       const entries = ctx.sessionManager.getEntries();
       const lastAssistant = getLastAssistantMessage(entries);
 
@@ -856,11 +922,21 @@ export default function (pi: ExtensionAPI) {
   // has settled, so it does NOT block the agent. The agent is idle during
   // the sleep and can respond to user input (e.g. Escape to abort).
   //
-  // Before each retry, the error assistant message is removed from
-  // agent.state.messages so the LLM receives a clean context (same
-  // technique as the built-in retry's _prepareRetry).
+  // Before each retry, omit the failed response from Pi's canonical
+  // SessionManager projection; older SDKs use the live Agent-state fallback.
   // TEST:__tests__/unit/user-retry-regression.test.ts[reported retry regressions]
-  async function triggerInvisibleContinue(initialKind: HiddenTurnKind, myAgent: Agent) {
+  /**
+   * Drive hidden retry and continuation turns for one session.
+   *
+   * @param initialKind Hidden turn kind selected by the event or command.
+   * @param myAgent Agent bound to the triggering session.
+   * @param sessionManager Stable session-manager identity used by the registry.
+   */
+  async function triggerInvisibleContinue(
+    initialKind: HiddenTurnKind,
+    myAgent: Agent,
+    sessionManager: unknown,
+  ) {
     // Keep the Agent that started this loop. Session replacement is handled by
     // the ordinary generation and exact session-manager ownership checks.
     if (!myAgent) return;
@@ -905,6 +981,8 @@ export default function (pi: ExtensionAPI) {
       // Count only ordinary retry turns; continuation turns use the next retry slot
       // without consuming it, so max_tokens/empty responses cannot stretch the error backoff.
       let retryAttempt = 0;
+      // Track intermediate successful turns, not just the last message at idle.
+      let observedSuccessGeneration = successGeneration;
       let hiddenTurnKind: HiddenTurnKind | null = initialKind;
       // Empty-stop nudges are bounded: a model that produced no usable output
       // and answers the nudge with another empty turn is decided, not stalled.
@@ -929,7 +1007,7 @@ export default function (pi: ExtensionAPI) {
           didRetryComplete = true;
           return;
         }
-        removeErrorFromAgentState(myAgent);
+        removeErrorFromRetryContext(sessionManager, myAgent);
 
         // Empty-stop cap: a model that produced no usable output and answers
         // the nudge with another empty turn is decided, not stalled. Stop
@@ -945,6 +1023,14 @@ export default function (pi: ExtensionAPI) {
           emptyNudges++;
         }
 
+        // A successful tool response ends the previous failure sequence even
+        // when a later request fails before the same Agent run becomes idle.
+        if (observedSuccessGeneration !== successGeneration) {
+          observedSuccessGeneration = successGeneration;
+          retryAttempt = 0;
+          maxDelayRetries = 0;
+          emptyNudges = 0;
+        }
         const delayAttempt = hiddenTurnKind === "retry"
           ? ++retryAttempt
           : Math.max(1, retryAttempt + 1);
@@ -1016,6 +1102,7 @@ export default function (pi: ExtensionAPI) {
         // check prevents scheduling one more capped request.
         if (
           hiddenTurnKind === "retry" &&
+          observedSuccessGeneration === successGeneration &&
           maxDelayRetries >= retryConfig.maxRetriesAtMaxDelay
         ) {
           notifySafely(
