@@ -165,14 +165,21 @@ export function getSessionAgent(sessionManager: unknown): Agent | undefined {
 }
 
 /**
- * Wait until a session has finished the run it just started.
+ * Wait until a session has finished its current run, including the work that
+ * follows it.
  *
- * `Agent.waitForIdle()` only covers the low-level run, which is published after
- * `AgentSession._prepareRun()` completes. Right after `pi.sendMessage()` the
- * Agent can therefore still look idle, so a retry loop that waits on it moves
- * on before the hidden turn even starts and loses its backoff state.
- * `AgentSession.waitForIdle()` is flagged busy synchronously by the send and
- * also settles when the run fails to start, so it is the correct barrier.
+ * `Agent.waitForIdle()` only covers the low-level run. That run is published
+ * after `AgentSession._prepareRun()` completes, so right after
+ * `pi.sendMessage()` the Agent can still look idle, and a retry loop that waits
+ * on it moves on before the hidden turn even starts and loses its backoff
+ * state. The same wrapper also emits `agent_settled` after the run, and a
+ * message sent during that emission is deferred until it ends. The session's
+ * `waitForIdle()` is flagged busy synchronously by a send, covers the settle
+ * phase and compaction, and also settles when the run fails to start, so it is
+ * the correct barrier before and after a hidden retry send.
+ *
+ * TEST:__tests__/unit/session-registry.test.ts[waitForSessionIdle]
+ * TEST:__tests__/integration/detached-backoff.test.ts[detached retry loop backoff]
  *
  * @param sessionManager Session manager object from ExtensionContext.
  * @param agent Agent the caller is driving; used as the fallback barrier.

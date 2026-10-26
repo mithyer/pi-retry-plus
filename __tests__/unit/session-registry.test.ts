@@ -144,18 +144,6 @@ describe("session registry ownership", () => {
   });
 });
 
-/**
- * Map a manager to an explicit session object, as the SDK bind hook does.
- *
- * @param manager Session-manager identity used as the registry key.
- * @param agent Agent owned by the session.
- * @param session Structural AgentSession stand-in recorded for the manager.
- */
-function mapSession(manager: object, agent: object, session: object): void {
-  const registry = (globalThis as any)[Symbol.for("pi-retry.session-registry.v1")];
-  registry.records.set(manager, { session, agent });
-}
-
 describe("waitForSessionIdle", () => {
   // TEST target: src/session-registry.ts[waitForSessionIdle]
   // The session lifecycle is the barrier: the Agent may look idle while the
@@ -179,7 +167,7 @@ describe("waitForSessionIdle", () => {
         });
       },
     };
-    mapSession(manager, agent, session);
+    recordRetrySessionAgent(manager, agent as any, session as any);
 
     let settled = false;
     const waiting = waitForSessionIdle(manager, agent as any).then(() => {
@@ -230,7 +218,7 @@ describe("waitForSessionIdle", () => {
         sessionWaits++;
       },
     };
-    mapSession(manager, ownedAgent, session);
+    recordRetrySessionAgent(manager, ownedAgent as any, session as any);
 
     await waitForSessionIdle(manager, staleAgent as any);
     expect(sessionWaits).toBe(0);
