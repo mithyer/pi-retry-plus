@@ -70,11 +70,6 @@ function createMockAPI() {
     for (const handler of handlers["before_agent_start"] ?? []) {
       void handler({ prompt: "" }, {});
     }
-    // AgentSession forwards agent_start to extensions when the Agent run begins;
-    // the retry loop waits for it before it waits for the hidden turn to finish.
-    for (const handler of handlers["agent_start"] ?? []) {
-      void handler({ type: "agent_start" }, {});
-    }
     void activeMockAgent?.prompt([]).catch(() => {});
   });
 

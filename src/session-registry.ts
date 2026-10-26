@@ -17,6 +17,8 @@ type AgentSessionLike = {
   _prepareRetry?: (message: unknown) => Promise<boolean>;
   /** Canonical context omission hook introduced by pi 0.87. */
   _omitRecoveryAttempt?: (message: unknown) => void;
+  /** Resolves once the whole session lifecycle (not just the Agent run) is idle. */
+  waitForIdle?: () => Promise<void>;
 };
 
 /** The SDK identity captured before an extension registers its own policy. */
@@ -163,6 +165,43 @@ export function getSessionAgent(sessionManager: unknown): Agent | undefined {
 }
 
 /**
+ * Wait until a session has finished its current run, including the work that
+ * follows it.
+ *
+ * `Agent.waitForIdle()` only covers the low-level run. That run is published
+ * after `AgentSession._prepareRun()` completes, so right after
+ * `pi.sendMessage()` the Agent can still look idle, and a retry loop that waits
+ * on it moves on before the hidden turn even starts and loses its backoff
+ * state. The same wrapper also emits `agent_settled` after the run, and a
+ * message sent during that emission is deferred until it ends. The session's
+ * `waitForIdle()` is flagged busy synchronously by a send, covers the settle
+ * phase and compaction, and also settles when the run fails to start, so it is
+ * the correct barrier before and after a hidden retry send.
+ *
+ * TEST:__tests__/unit/session-registry.test.ts[waitForSessionIdle]
+ * TEST:__tests__/integration/detached-backoff.test.ts[detached retry loop backoff]
+ *
+ * @param sessionManager Session manager object from ExtensionContext.
+ * @param agent Agent the caller is driving; used as the fallback barrier.
+ * @returns Resolves when the session (or, without a mapped session, the Agent) is idle.
+ */
+export async function waitForSessionIdle(
+  sessionManager: unknown,
+  agent: Agent,
+): Promise<void> {
+  const record = sessionManager && typeof sessionManager === "object"
+    ? sharedRegistry().records.get(sessionManager)
+    : undefined;
+  // Only trust the session when it still owns this exact Agent; a replaced
+  // session must not make an old loop wait on a different lifecycle.
+  if (record && record.agent === agent && typeof record.session.waitForIdle === "function") {
+    await record.session.waitForIdle();
+    return;
+  }
+  await agent.waitForIdle();
+}
+
+/**
  * Register this extension's policy for one session after its session_start hook.
  *
  * @param sessionManager Session manager object from ExtensionContext.
@@ -263,13 +302,14 @@ export function recordRetrySessionAgent(
  * Pi 0.87+ builds provider context from SessionManager projections rather than
  * from direct assignments to `agent.state.messages`. Its private recovery hook
  * records a context edit while retaining the failed response in raw history;
- * older SDKs and lightweight fixtures fall back to the former live-state edit.
+ * older SDKs, lightweight fixtures, and a throwing hook fall back to the former
+ * live-state edit.
  *
  * @param sessionManager Session manager identity exposed by ExtensionContext.
  * @param agent Agent whose trailing response is being retried.
  * @returns Nothing; the response is omitted from the next provider projection.
  *
- * TEST:__tests__/unit/session-registry.test.ts[uses canonical retry omission]
+ * TEST:__tests__/unit/session-registry.test.ts[uses canonical retry omission, falls back when the canonical omission hook throws]
  */
 export function removeErrorFromRetryContext(
   sessionManager: unknown,
@@ -286,10 +326,17 @@ export function removeErrorFromRetryContext(
     : undefined;
   const omitRecoveryAttempt = record?.session._omitRecoveryAttempt;
   if (record && typeof omitRecoveryAttempt === "function") {
-    omitRecoveryAttempt.call(record.session, lastMessage);
-    return;
+    try {
+      omitRecoveryAttempt.call(record.session, lastMessage);
+      return;
+    } catch {
+      // The private hook can throw (for example when a projected message has no
+      // source entry). The retry loop is started with `void`, so a throw here would
+      // become an unhandled rejection; fall back to the live-state edit instead.
+    }
   }
 
-  // Compatibility path for pi versions before canonical SessionManager context.
+  // Compatibility path for pi versions before canonical SessionManager context,
+  // and fallback when the canonical hook throws.
   agent.state.messages = messages.slice(0, -1);
 }

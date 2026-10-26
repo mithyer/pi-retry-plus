@@ -35,6 +35,7 @@ import {
   registerRetrySession,
   supportsSettleBoundary,
   unregisterRetrySession,
+  waitForSessionIdle,
 } from "./src/session-registry.js";
 
 const RETRY_STARTED_EVENT = "pi-retry:started";
@@ -118,25 +119,31 @@ let _warnedMessageFreeUnsupported = false;
 
 let _terminalInputUnsubscribe: (() => void) | null = null;
 
-// 唤醒句柄:当前正在等待的退避睡眠提供它,手动 /retry 调用后立即结束等待。
-// 只有处于睡眠中时才非空;睡眠以任何方式结束都会清空它。
+// Wake handle supplied by the backoff sleep that is currently waiting; a manual
+// /retry calls it to end the wait at once. Non-null only while a sleep is in
+// progress, and cleared whenever the sleep ends for any reason.
 // TEST:__tests__/unit/user-retry-regression.test.ts[manual retry skips the active backoff wait]
 let _wakeBackoffSleep: (() => void) | null = null;
 
 /**
- * 让正在退避等待的自动重试循环立刻发起重试(供手动 /retry 使用)。
+ * Make an automatic retry loop that is sleeping in backoff retry right away
+ * (used by a manual /retry).
  *
- * 自动重试循环持有 _continueInProgress 互斥锁;若手动触发再去启动一个新循环,
- * 会被互斥锁直接丢弃,表现为"/retry 没有反应"。因此这里改为唤醒已有循环的睡眠。
+ * The automatic loop holds the _continueInProgress mutex, so starting a second
+ * loop from a manual trigger would be dropped by that mutex and /retry would
+ * appear to do nothing. Waking the existing loop's sleep avoids that.
  *
- * @returns "none" 当前没有存活的自动重试循环,调用方应按原流程启动新循环;
- *   "skipped" 已打断退避等待,循环会马上发送重试;
- *   "running" 循环存活但不在退避等待中(重试请求正在进行),无需再做任何事。
+ * @returns "none" when no automatic retry loop is alive, so the caller should
+ *   start a new loop as usual;
+ *   "skipped" when the backoff wait was cut short and the loop sends the retry now;
+ *   "running" when the loop is alive but not in backoff (a retry request is in
+ *   flight), so nothing more needs to be done.
  */
 // TEST:__tests__/unit/user-retry-regression.test.ts[manual retry skips the active backoff wait]
 function skipLiveBackoff(): "none" | "skipped" | "running" {
-  // 与 agent_end 中"循环是否仍然有效"的判断保持一致:
-  // 会话或用户输入代数已变化、或用户已中止的循环正在退出,不能当作存活。
+  // Keep this consistent with the "is the loop still valid" check in agent_end:
+  // a loop whose session or input generation changed, or that the user has
+  // aborted, is on its way out and must not be treated as alive.
   const live =
     _continueInProgress &&
     _continueGeneration === _sessionGeneration &&
@@ -168,14 +175,15 @@ function interruptibleSleep(
     const checkInterval = 100;
     let elapsed = 0;
     onRemaining?.(ms);
-    // 统一的收尾出口:停止计时、注销唤醒句柄,再交还结果。
+    // Single exit path: stop the timer, unregister the wake handle, then report the result.
     const finish = (interrupted: boolean) => {
       clearInterval(timer);
       if (_wakeBackoffSleep === wake) _wakeBackoffSleep = null;
       resolve(interrupted);
     };
-    // 手动唤醒:提前结束等待。仍要检查中止/换会话/新输入,
-    // 否则已失效的循环会被误唤醒并继续发送重试。
+    // Manual wake: end the wait early. Abort, session change and new input must
+    // still be checked, otherwise a loop that is no longer valid would be woken
+    // up and go on to send a retry.
     const wake = () => {
       onRemaining?.(0);
       finish(
@@ -199,55 +207,6 @@ function interruptibleSleep(
       }
     }, checkInterval);
     _wakeBackoffSleep = wake;
-  });
-}
-
-// Upper bound for waiting until a hidden retry turn actually starts running.
-// Pi >= 1.2 prepares a run asynchronously (auto-compaction check plus every
-// before_agent_start handler) and compaction may call a model, so allow a long
-// window. User actions still interrupt the wait within one poll tick.
-const HIDDEN_RUN_START_TIMEOUT_MS = 10 * 60 * 1000;
-const HIDDEN_RUN_START_POLL_MS = 10;
-
-/**
- * Wait until a hidden turn queued with pi.sendMessage() has really started.
- *
- * Pi >= 1.2 builds the run asynchronously, so right after sendMessage() the
- * low-level Agent has no active run yet and Agent.waitForIdle() resolves at once.
- * Treating that as "the retry turn finished" ends the loop early and discards the
- * backoff counter, so every failure restarts at the base delay.
- *
- * @param hasStarted Returns true once the hidden turn emitted agent_start.
- * @param generation Session generation captured by the waiting loop.
- * @param inputGeneration Input generation captured by the waiting loop.
- * @returns true when the run started; false when interrupted (abort, new input,
- *   session change) or when the safety timeout elapsed.
- */
-// TEST:__tests__/integration/main-backoff.test.ts[grows the delay between consecutive failures instead of repeating the base delay]
-function waitForHiddenRunStart(
-  hasStarted: () => boolean,
-  generation: number,
-  inputGeneration: number,
-): Promise<boolean> {
-  if (hasStarted()) return Promise.resolve(true);
-  return new Promise(resolve => {
-    let elapsed = 0;
-    const timer = setInterval(() => {
-      elapsed += HIDDEN_RUN_START_POLL_MS;
-      if (hasStarted()) {
-        clearInterval(timer);
-        resolve(true);
-      } else if (
-        _userAborted ||
-        _sessionGeneration !== generation ||
-        _inputGeneration !== inputGeneration ||
-        elapsed >= HIDDEN_RUN_START_TIMEOUT_MS
-      ) {
-        // The caller re-checks the same guards right after this returns.
-        clearInterval(timer);
-        resolve(false);
-      }
-    }, HIDDEN_RUN_START_POLL_MS);
   });
 }
 
@@ -330,11 +289,6 @@ export default function (pi: ExtensionAPI) {
   // Successful turns can occur inside a run before waitForIdle observes its final error.
   // TEST:__tests__/unit/user-retry-regression.test.ts[restarts ordinary backoff after tool success inside the same run]
   let successGeneration = 0;
-  // Number of agent runs this session has started. The detached retry loop uses
-  // it to tell that a hidden turn queued with sendMessage() is really running.
-  // Kept per extension instance so a concurrent subagent session cannot fake it.
-  // TEST:__tests__/integration/main-backoff.test.ts[grows the delay between consecutive failures instead of repeating the base delay]
-  let agentStartCount = 0;
   let retryConfig = { ...DEFAULT_RETRY_CONFIG };
   const owner = pi as unknown as object;
   // Policy source of each inline controller, so a session reclassified between
@@ -466,11 +420,6 @@ export default function (pi: ExtensionAPI) {
     configureSession(ctx, event.systemPrompt);
   });
 
-  // Count started runs; see waitForHiddenRunStart().
-  pi.on("agent_start", () => {
-    agentStartCount++;
-  });
-
   // An armed message-free retry omits the failed response and continues here.
   pi.on("agent_before_settle", (event, ctx) => {
     const binding = getRetrySession(ctx.sessionManager);
@@ -520,9 +469,11 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     if (msg.role === "assistant" && msg.stopReason !== "error") {
-      if (msg.stopReason !== "length" && !hasEmptyStop(msg)) {
-        // Notify the detached driver as well as resetting diagnostic counters.
-        successGeneration++;
+      if (msg.stopReason !== "length") {
+        // Tell the detached retry driver that a real success happened. An empty
+        // stop is not one: it is retried by a nudge, so it must not restart the
+        // error backoff. The counters below keep their original behaviour.
+        if (!hasEmptyStop(msg)) successGeneration++;
         // Normal completion — reset everything including continuation count
         state400.succeed();
         stateCredit.succeed();
@@ -785,8 +736,9 @@ export default function (pi: ExtensionAPI) {
 
       // /retry (no args) - Manual trigger with auto-detection
       //
-      // 自动重试循环正在退避等待时,不能再启动第二个循环(会被互斥锁丢弃),
-      // 而是直接打断这次等待,让它立刻发起重试。
+      // While the automatic retry loop sleeps in backoff, a second loop cannot be
+      // started (the mutex would drop it); cut the wait short so the existing
+      // loop retries immediately.
       // TEST:__tests__/unit/user-retry-regression.test.ts[manual retry skips the active backoff wait]
       const liveLoop = skipLiveBackoff();
       if (liveLoop === "skipped") {
@@ -1009,9 +961,12 @@ export default function (pi: ExtensionAPI) {
     try {
       emitRetryLifecycleEvent(RETRY_STARTED_EVENT, retryLifecycleId);
 
-      // Wait for the current run to finish (activeRun resolves in
-      // finishRun() after agent_end listeners return).
-      await myAgent.waitForIdle();
+      // Wait for the whole session lifecycle, not just the low-level run. The
+      // Agent run resolves once agent_end listeners return, but AgentSession
+      // then emits agent_settled. A hidden message sent while that event is
+      // still being emitted is deferred, so the wait after the send would
+      // return at once and the backoff would restart from attempt 0.
+      await waitForSessionIdle(sessionManager, myAgent);
 
       // AgentSession clears its outer lifecycle immediately after Agent's
       // active run resolves. Yield to the next macrotask so the detached path
@@ -1105,8 +1060,6 @@ export default function (pi: ExtensionAPI) {
         if (interrupted || _inputGeneration !== myInputGeneration) return;
 
         try {
-          // Snapshot before sending: agent_start may fire before sendMessage returns.
-          const startsBeforeSend = agentStartCount;
           pi.sendMessage(
             {
               customType: hiddenTurnKind === "retry"
@@ -1123,19 +1076,14 @@ export default function (pi: ExtensionAPI) {
             { triggerTurn: true, deliverAs: "followUp" },
           );
 
-          // sendMessage is fire-and-forget. Pi 1.1 published the low-level run
-          // synchronously, but Pi >= 1.2 awaits run preparation (compaction check
-          // and every before_agent_start handler) first, so Agent.waitForIdle()
-          // alone would return before the hidden turn exists. That ended this loop
-          // after one retry and the agent_end handler restarted it with
-          // retryAttempt = 0, i.e. a flat base delay. Wait for agent_start first.
+          // sendMessage is fire-and-forget. AgentSession marks itself busy
+          // synchronously, but the low-level Agent run only appears after
+          // _prepareRun() finishes, so Agent.waitForIdle() can return before the
+          // hidden turn starts. That made the loop read the stale tool result,
+          // treat the retry as complete, and restart backoff from attempt 0.
+          // Wait on the session lifecycle instead (falls back to Agent).
           await Promise.resolve();
-          await waitForHiddenRunStart(
-            () => agentStartCount > startsBeforeSend,
-            myGeneration,
-            myInputGeneration,
-          );
-          await myAgent.waitForIdle();
+          await waitForSessionIdle(sessionManager, myAgent);
         } catch {
           return;
         }
