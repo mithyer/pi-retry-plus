@@ -40,7 +40,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sdk-version: ["0.85.1", "1.0.1"]
+        include:
+          # Pre-0.87 SDK: no agent_before_settle boundary, so the extension uses the
+          # legacy live-state fallback. The source imports 0.87+ types, so tsc cannot
+          # pass here; the `locked` job already type-checks against the pinned SDK.
+          - sdk-version: "0.85.1"
+            companions: "@earendil-works/chord@0.85.1"
+            typecheck: false
+          # Pi 1.0: canonical context projection, but agent_settled has no `aborted` flag.
+          - sdk-version: "1.0.1"
+            companions: "@earendil-works/chord@1.0.1 @earendil-works/pi-codemode@1.0.1 @earendil-works/pi-mcp@1.0.1"
+            typecheck: true
+    # Keep the job name `test (<sdk-version>)`; the extra matrix keys would otherwise be appended to it.
+    name: test (${{ matrix.sdk-version }})
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -51,13 +63,22 @@ jobs:
         with:
           node-version: 22.19.0
 
+      - name: Update npm
+        # npm 10.9.3 (bundled with Node 22.19.0) crashes on this dependency tree with
+        # "Cannot read properties of null (reading 'edgesOut')"; npm 11 installs it.
+        run: npm install --global npm@11.6.2
+
       - name: Install dependencies for the SDK matrix entry
+        # Without a lockfile, the SDK's own "^x.y.z" dependencies float to the newest
+        # release (for example pi-codemode 1.4.0 under pi-coding-agent 1.0.1), which
+        # breaks module imports. The companion packages are therefore pinned too.
         run: >-
           npm install --no-package-lock --ignore-scripts --no-save
           @earendil-works/pi-ai@${{ matrix.sdk-version }}
           @earendil-works/pi-agent-core@${{ matrix.sdk-version }}
           @earendil-works/pi-coding-agent@${{ matrix.sdk-version }}
           @earendil-works/pi-tui@${{ matrix.sdk-version }}
+          ${{ matrix.companions }}
           @types/node@25.9.1
           @vitest/coverage-v8@4.1.7
           knip@6.14.1
@@ -68,6 +89,7 @@ jobs:
         run: npm test -- --reporter=dot
 
       - name: Run type check
+        if: matrix.typecheck
         run: npm run typecheck
 
       - name: Run dead-code check
