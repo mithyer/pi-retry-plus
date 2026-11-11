@@ -34,7 +34,9 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { fauxAssistantMessage, fauxProvider, fauxToolCall, Type } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
+// Pi 1.5 no longer re-exports the schema builder from pi-ai.
+import { Type } from "typebox";
 import retryExtension from "../../retry.ts";
 
 const temporaryRoots: string[] = [];
