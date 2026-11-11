@@ -25,10 +25,10 @@ import {
   fauxAssistantMessage,
   fauxProvider,
   fauxToolCall,
-  Type,
   type AssistantMessage,
   type Context,
 } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import retryExtension from "../../retry.ts";
 
 const temporaryRoots: string[] = [];
